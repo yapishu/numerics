@@ -464,28 +464,49 @@
   ::      .inf
   ::  Source
   ++  exp
+    ~/  %exp
     |=  x=@rs  ^-  @rs
-    ::  filter out non-finite arguments
-    ?:  =(x 0x0)  .1
-    ::    check infinities
-    ?:  =(x 0x7f80.0000)  `@rs`0x7f80.0000  :: exp(+inf) -> inf
-    ?:  =(x 0xff80.0000)  .0.0              :: exp(-inf) -> 0
-    ::    check NaN
-    ?.  (^gte (dis 0x7fc0.0000 x) 0)  `@rs`0x7fc0.0000  :: exp(NaN) -> NaN
-    ::    check overflow to infinity
-    =/  o-threshold  `@rs`0x42b0.c0a8  ::  88.72283905206835, value above which exp(x) overflows
-    ?:  (gth x o-threshold)  (mul huge huge)
-    ::    check underflow to zero
-    =/  u-threshold  `@rs`0xc2b0.c0a8  ::  -88.72283905206835, value below which exp(x) underflows
-    ?:  (lth x u-threshold)  (mul tiny tiny)
-    ::  otherwise, use Taylor series
-    =/  p   .1
-    =/  po  .-1
-    =/  i   .1
-    |-  ^-  @rs
-    ?:  (lth (abs (sub po p)) rtol)
-      p
-    $(i (add i .1), p (add p (div (pow-n x i) (factorial i))), po p)
+    ::  Deterministic: range-reduce, Horner polynomial on 1/n!, scale by 2^k
+    ::  via exponent-field add. Mirrors vere pkg/noun/jets/e/math_rs.c.
+    ::
+    ::  specials — bit-pattern checks must match the jet exactly
+    ?:  =(x 0x0)          .1                              :: +0
+    ?:  =(x 0x8000.0000)  .1                              :: -0
+    ?:  =(x 0x7f80.0000)  `@rs`0x7f80.0000                :: +inf
+    ?:  =(x 0xff80.0000)  .0                              :: -inf -> +0
+    ?:  ?&  =(0x7f80.0000 (dis 0x7f80.0000 x))
+            !=(0 (dis 0x7f.ffff x))
+        ==
+      `@rs`0x7fc0.0000                                    :: NaN
+    ?:  (gth x `@rs`0x42b1.7218)  `@rs`0x7f80.0000        :: > 88.723  -> +inf
+    ?:  (lth x `@rs`0xc2ae.ac50)  .0                      :: < -87.336 -> +0
+    ::  range reduction
+    =/  ln2     `@rs`0x3f31.7218
+    =/  invln2  `@rs`0x3fb8.aa3b
+    =/  scaled  (mul x invln2)
+    =/  k-s     (need (toi scaled))        :: @s
+    =/  kf      (san k-s)                  :: @rs from @s
+    =/  rr      (sub x (mul kf ln2))
+    ::  Horner polynomial of exp(r) = sum_{n=0}^{6} r^n / n!
+    =/  p  `@rs`0x3ab6.0b61                :: c6 = 1/720
+    =.  p  (add (mul p rr) `@rs`0x3c08.8889)   :: c5 = 1/120
+    =.  p  (add (mul p rr) `@rs`0x3d2a.aaab)   :: c4 = 1/24
+    =.  p  (add (mul p rr) `@rs`0x3e2a.aaab)   :: c3 = 1/6
+    =.  p  (add (mul p rr) `@rs`0x3f00.0000)   :: c2 = 1/2
+    =.  p  (add (mul p rr) `@rs`0x3f80.0000)   :: c1 = 1
+    =.  p  (add (mul p rr) `@rs`0x3f80.0000)   :: c0 = 1
+    ::  scale by 2^k via exponent-field add (pure integer arithmetic)
+    =+  [k-pos=(syn:si k-s) k-mag=(abs:si k-s)]
+    =/  exp-f=@   (dis 0xff (rsh [0 23] `@`p))
+    ?:  k-pos
+      =/  ne  (^add exp-f k-mag)
+      ?:  (^gte ne 0xff)  `@rs`0x7f80.0000
+      `@rs`(con (dis `@`p 0x807f.ffff) (lsh [0 23] ne))
+    ::  k negative: subtract
+    ?:  (^lth exp-f k-mag)  .0
+    =/  ne  (^sub exp-f k-mag)
+    ?:  =(0 ne)  .0
+    `@rs`(con (dis `@`p 0x807f.ffff) (lsh [0 23] ne))
   ::    +sin:  @rs -> @rs
   ::
   ::  Returns the sine of a floating-point atom.
@@ -688,25 +709,42 @@
   ::      .0.9999994
   ::  Source
   ++  log
+    ~/  %log
     |=  z=@rs  ^-  @rs
-    ::  filter out non-finite arguments
-    ::    check infinities
-    ?:  =(z 0x7f80.0000)  `@rs`0x7f80.0000  :: log(+inf) -> inf
-    ?:  =(z 0xff80.0000)  `@rs`0x7fc0.0000  :: log(-inf) -> NaN
-    ::    check NaN
-    ?.  (^gte (dis 0x7fc0.0000 z) 0)  `@rs`0x7fc0.0000  :: exp(NaN) -> NaN
-    ::  otherwise, use Taylor series
-    =/  p   .0
-    =/  po  .-1
-    =/  i   .0
-    |-  ^-  @rs
-    ?:  (lth (abs (sub po p)) rtol)
-      (mul (div (mul .2 (sub z .1)) (add z .1)) p)
-    =/  term1  (div .1 (add .1 (mul .2 i)))
-    =/  term2  (mul (sub z .1) (sub z .1))
-    =/  term3  (mul (add z .1) (add z .1))
-    =/  term  (mul term1 (pow-n (div term2 term3) i))
-    $(i (add i .1), p (add p term), po p)
+    ::  Deterministic: decompose z = m * 2^e, log(z) = e*ln2 + log(m),
+    ::  log(m) via series in f=(m-1)/(m+1). Mirrors vere math_rs.c.
+    ::
+    ::  specials
+    ?:  =(z 0x0)          `@rs`0xff80.0000              :: +0 -> -inf
+    ?:  =(z 0x8000.0000)  `@rs`0xff80.0000              :: -0 -> -inf
+    ?:  !=(0 (dis z 0x8000.0000))  `@rs`0x7fc0.0000     :: negative -> NaN
+    ?:  =(z 0x7f80.0000)  `@rs`0x7f80.0000              :: +inf
+    ?:  ?&  =(0x7f80.0000 (dis 0x7f80.0000 z))
+            !=(0 (dis 0x7f.ffff z))
+        ==
+      `@rs`0x7fc0.0000                                  :: NaN
+    ?:  =(z `@rs`0x3f80.0000)  .0                       :: log(1) = 0
+    ::  decompose z = m * 2^e  where m in [1,2)
+    =/  exp-f=@   (dis 0xff (rsh [0 23] `@`z))
+    =/  e-signed=@s
+      ?:  (^gte exp-f 127)  (sun:si (^sub exp-f 127))
+      (new:si | (^sub 127 exp-f))
+    =/  ef  (san e-signed)                  :: @rs
+    =/  m-bits  (con (dis `@`z 0x7f.ffff) 0x3f80.0000)
+    =/  m  `@rs`m-bits
+    ::  f = (m-1)/(m+1)
+    =/  f    (div (sub m .1) (add m .1))
+    =/  f2   (mul f f)
+    ::  Horner: 1 + f²/3 + f⁴/5 + f⁶/7 + f⁸/9
+    =/  p  `@rs`0x3de3.8e39              :: 1/9
+    =.  p  (add (mul p f2) `@rs`0x3e12.4925)   :: 1/7
+    =.  p  (add (mul p f2) `@rs`0x3e4c.cccd)   :: 1/5
+    =.  p  (add (mul p f2) `@rs`0x3eaa.aaab)   :: 1/3
+    =.  p  (add (mul p f2) `@rs`0x3f80.0000)   :: 1
+    ::  log(m) = 2*f*p
+    =/  log-m  (mul `@rs`0x4000.0000 (mul f p))
+    ::  log(z) = e*ln2 + log(m)
+    (add (mul ef `@rs`0x3f31.7218) log-m)
   ::    +log-10:  @rs -> @rs
   ::
   ::  Returns the base-10 logarithm of a floating-point atom.
@@ -792,16 +830,8 @@
   ::      > (sqt .1e5)
   ::      .316.22775
   ::  Source
-  ++  sqt
-    |=  x=@rs  ^-  @rs
-    ?>  (sgn x)
-    ?:  =(.0 x)  .0
-    =/  g=@rs  (div x .2)
-    |-
-    =/  n=@rs  (mul .0.5 (add g (div x g)))
-    ?.  (gth (abs (sub g n)) rtol)
-      n
-    $(g n)
+  ::  delegate to zuse's jetted SoftFloat sqrt (bit-deterministic)
+  ++  sqt  sqt:^rs
   ::    +cbrt:  @rs -> @rs
   ::
   ::  Returns the cube root of a floating-point atom.

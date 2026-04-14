@@ -345,9 +345,13 @@
     |=  a=ray:ls
     ^-  ray
     =,  (lake rnd)
+    ::  stable form: tanh(x) = 1 - 2/(1 + e^(2x))
+    ::  when e^(2x) overflows to +inf, 2/(1+inf)=0, result=1 (correct).
+    ::  the naive (e^2x - 1)/(e^2x + 1) gives NaN for overflow.
     =/  one  (ones:la meta.a)
+    =/  two  (add one one)
     =/  e2x  (exp (add a a))
-    (div (sub e2x one) (add e2x one))
+    (sub one (div two (add one e2x)))
   ::    +gelu: $ray -> $ray
   ::
   ::  GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))

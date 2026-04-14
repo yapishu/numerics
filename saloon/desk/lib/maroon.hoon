@@ -10,6 +10,7 @@
     math,
     saloon
 ::
+~%  %maroon  ..part  ~
 |%
 ::  Types
 ::
@@ -70,13 +71,35 @@
       =bloq                       ::  precision (5=@rs, 6=@rd)
   ==
 ::
-::  +load-weights: cue a jammed atom into model-weights
-::  The jammed atom should be produced by weights_to_noun.py
+::  +load-weights: cue a jammed atom into model-weights.
 ::
 ++  load-weights
   |=  jammed=@
   ^-  model-weights
   ;;(model-weights (cue jammed))
+::
+::  +dequant-q8-ray: int8 ray + scale -> fp32 ray.  JETTED as %dequant-q8.
+::  Pure Hoon reference; the C jet does this much faster.
+::
+++  dequant-q8-ray
+  ~/  %dequant-q8
+  |=  [r=tensor scale=@rs]
+  ^-  tensor
+  =/  la  (lake %n)
+  =/  rs-door  ~(. rs:math [%n .1e-5])
+  =/  bytes  (ravel:la r)
+  =/  shape-out  shape.meta.r
+  =/  new-meta=meta:ls  [shape-out 5 %i754 ~]
+  =/  f32-vals=(list @)
+    %+  turn  bytes
+    |=  b=@
+    ?:  =(0 b)  .0
+    ?:  (lth b 128)
+      (mul:rs-door (sun:rs-door b) scale)
+    =/  mag  (sun:rs-door (sub 256 b))
+    (mul:rs-door (mul:rs-door mag .-1) scale)
+  =/  data-out  (con data:(zeros:la new-meta) (rep 5 f32-vals))
+  [new-meta data-out]
 ::
 ++  mr
   =+  [rnd=*rounding-mode]
@@ -95,34 +118,15 @@
     ::  broadcast bias across rows: add b to each row of out
     (add-bias out b.lw)
   ::
-  ::  +dequantize: return the tensor as @rs-typed tensor,
-  ::  dequantizing from int8 if needed.
+  ::  +dequantize: return a tensor as fp32, dequantizing from int8 if needed.
+  ::  Calls the top-level jetted +dequant-q8-ray.
   ::
   ++  dequantize
     |=  w=weight-tensor
     ^-  tensor
-    ?-    -.w
-        %fp  r.w
-        %q8
-      =/  la  (lake rnd)
-      ::  r.w stores bytes in a @uint bloq=3 ray.
-      ::  For each byte: if b < 128 signed = b, else signed = b - 256.
-      ::  Float value = signed * scale.
-      =/  rs-door  ~(. rs:math [rnd .1e-5])
-      =/  bytes  (ravel:la r.w)
-      =/  shape-out  shape.meta.r.w
-      =/  new-meta=meta:ls  [shape-out 5 %i754 ~]
-      =/  f32-vals=(list @)
-        %+  turn  bytes
-        |=  b=@
-        ?:  =(0 b)  .0
-        ?:  (lth b 128)
-          (mul:rs-door (sun:rs-door b) scale.w)
-        ::  b >= 128: signed = b - 256, float = -(256 - b) * scale
-        =/  mag  (sun:rs-door (sub 256 b))
-        (mul:rs-door (mul:rs-door mag .-1) scale.w)
-      =/  data-out  (con data:(zeros:la new-meta) (rep 5 f32-vals))
-      [new-meta data-out]
+    ?-  -.w
+      %fp  r.w
+      %q8  (dequant-q8-ray r.w scale.w)
     ==
   ::
   ::  +add-bias: add a [1 D] or [D] bias to each row of [S D]
@@ -214,7 +218,7 @@
         =/  rest  t.results
         |-  ^-  tensor
         ?~  rest  acc
-        $(acc (hstack acc i.rest), rest t.rest)
+        $(acc (hstack-2d acc i.rest), rest t.rest)
       ::  output projection
       (linear out wo)
     ::  extract columns [h*d_k, (h+1)*d_k - 1] for this head
@@ -292,8 +296,18 @@
     =/  seq-len  (lent tokens)
     ::  token embeddings: look up each token
     =/  x  (embed tokens tok-emb.weights bloq.config)
-    ::  add positional embeddings (first seq-len rows)
-    =/  pos  (submatrix ~[`[`0 `(dec seq-len)] ~] pos-emb.weights)
+    ::  add positional embeddings (first seq-len rows).
+    ::  NOTE: don't use `submatrix` here — when seq-len=1 the slice becomes
+    ::  `[0 0]` which lagoon reads as `[start=0 end=unset]` (whole dim).
+    ::  Copy rows explicitly.
+    =/  d-model  (snag 1 shape.meta.x)
+    =/  pos=tensor
+      =/  init  (zeros [~[seq-len d-model] bloq.config %i754 ~])
+      =/  i  0
+      |-  ^-  tensor
+      ?:  =(i seq-len)  init
+      =/  row  (get-row pos-emb.weights ~[i])
+      $(i +(i), init (set-row init ~[i] row))
     =/  x  (add x pos)
     ::  run through transformer blocks
     =/  blks  blocks.weights
@@ -330,35 +344,60 @@
     ^-  @ud
     (argmax:la logits)
   ::
-  ::  +sample-token: sample from a logits distribution.
-  ::  strategy:
-  ::    [%greedy]          — argmax (deterministic)
-  ::    [%temperature t]   — scale by 1/t, then sample from full softmax
-  ::    [%top-k k t]       — keep top-k, apply temperature, sample
-  ::  eny: entropy atom from the bowl (changes each request)
+  ::  +sampling: flat struct of knobs.
+  ::  Defaults mean "disabled":
+  ::    temp=.1         — no temperature scaling
+  ::    top-k=0         — no top-k filter
+  ::    top-p=.1        — no top-p filter
+  ::    rep-penalty=.1  — no repetition penalty
+  ::  Fully-default sampling is equivalent to greedy (argmax).
   ::
   +$  sampling
-    $%  [%greedy ~]
-        [%temperature t=@rs]
-        [%top-k k=@ud t=@rs]
+    $:  temp=@rs
+        top-k=@ud
+        top-p=@rs
+        rep-penalty=@rs
     ==
   ::
+  ++  default-sampling
+    ^-  sampling
+    [.1 0 .1 .1]
+  ::
+  ::  +sample-token: apply sampling pipeline and draw a token.
+  ::    rep-penalty (uses `context`) → temp → top-k → top-p → softmax → sample
+  ::  If every knob is at its default, returns argmax (greedy).
+  ::  `context` is the token history used for repetition penalty; pass ~ to skip.
+  ::
   ++  sample-token
-    |=  [logits=tensor strategy=sampling eny=@]
+    |=  [logits=tensor strategy=sampling context=(list @ud) eny=@]
     ^-  @ud
     =/  la  (lake rnd)
-    ?-    -.strategy
-        %greedy  (argmax-token logits)
-        %temperature
-      =/  scaled  (div-scalar:la logits t.strategy)
-      =/  probs  (softmax:sa:saloon scaled)
-      (sample-from-dist probs eny)
-        %top-k
-      =/  scaled  (div-scalar:la logits t.strategy)
-      =/  masked  (mask-top-k scaled k.strategy)
-      =/  probs  (softmax:sa:saloon masked)
-      (sample-from-dist probs eny)
-    ==
+    ::  greedy fast path: every knob at default
+    ?:  ?&  =(.1 temp.strategy)
+            =(0 top-k.strategy)
+            =(.1 top-p.strategy)
+            =(.1 rep-penalty.strategy)
+        ==
+      (argmax-token logits)
+    ::  1. repetition penalty
+    =/  logits
+      ?:  =(.1 rep-penalty.strategy)  logits
+      (apply-rep-penalty logits context rep-penalty.strategy)
+    ::  2. temperature
+    =/  logits
+      ?:  =(.1 temp.strategy)  logits
+      (div-scalar:la logits temp.strategy)
+    ::  3. top-k mask
+    =/  logits
+      ?:  =(0 top-k.strategy)  logits
+      (mask-top-k logits top-k.strategy)
+    ::  4. top-p mask
+    =/  logits
+      ?:  =(.1 top-p.strategy)  logits
+      (mask-top-p logits top-p.strategy)
+    ::  5. softmax + sample
+    =/  probs  (softmax:sa:saloon logits)
+    (sample-from-dist probs eny)
   ::
   ::  +sample-from-dist: sample an index from a probability distribution.
   ::  Uses inverse CDF: generate r in [0,1), find first index where cumsum >= r.
@@ -379,26 +418,92 @@
       i
     $(i +(i), els t.els, cum cum)
   ::
-  ::  +mask-top-k: set all but top-k logits to -inf.
+  ::  +mask-top-k: set all but top-k logits to -inf (works on any shape).
   ::
   ++  mask-top-k
     |=  [logits=tensor k=@ud]
     ^-  tensor
     =/  la  (lake rnd)
-    ?>  =(1 (lent shape.meta.logits))
-    =/  n  (snag 0 shape.meta.logits)
     =/  els  (ravel:la logits)
-    ::  sort descending to find the k-th largest value as threshold
+    =/  n  (lent els)
     =/  sorted-els  (sort els (fgth-gate bloq.meta.logits kind.meta.logits))
     =/  threshold  ?:((lte k n) (snag (dec k) sorted-els) (snag (dec n) sorted-els))
     =/  neg-inf  (fcon:sa:saloon bloq.meta.logits kind.meta.logits %neg-inf)
-    ::  mask anything below threshold to -inf
     =/  new-els=(list @)
       %+  turn  els
       |=  x=@
       ?:((fgte bloq.meta.logits kind.meta.logits x threshold) x neg-inf)
     :-  meta.logits
     (con data:(zeros:la meta.logits) (rep bloq.meta.logits new-els))
+  ::
+  ::  +mask-top-p: nucleus sampling mask. Keep the smallest set of tokens
+  ::  whose cumulative softmax probability >= p; mask the rest to -inf.
+  ::
+  ++  mask-top-p
+    |=  [logits=tensor p=@rs]
+    ^-  tensor
+    =/  la  (lake rnd)
+    =/  els  (ravel:la logits)
+    =/  n  (lent els)
+    ?:  =(0 n)  logits
+    =/  bloq  bloq.meta.logits
+    =/  kind  kind.meta.logits
+    ::  sort logits descending; softmax in that order; find cum-prob cutoff
+    =/  sorted-els  (sort els (fgth-gate bloq kind))
+    =/  sorted-meta=meta:ls  [~[n] bloq kind ~]
+    =/  sorted-ray=tensor
+      :-  sorted-meta
+      (con data:(zeros:la sorted-meta) (rep bloq sorted-els))
+    =/  probs  (softmax:sa:saloon sorted-ray)
+    =/  probs-list  (ravel:la probs)
+    ::  walk until cumulative >= p, record the logit at that index as threshold
+    =/  threshold
+      =|  cum=@
+      =.  cum  (fzero bloq kind)
+      =/  i  0
+      =/  sl  sorted-els
+      =/  pl  probs-list
+      |-  ^-  @
+      ?~  pl  (snag (dec n) sorted-els)
+      =.  cum  (fadd bloq kind cum i.pl)
+      ?:  (fgte bloq kind cum p)
+        ?~  sl  (snag (dec n) sorted-els)
+        i.sl
+      $(sl ?~(sl ~ t.sl), pl t.pl, i +(i))
+    =/  neg-inf  (fcon:sa:saloon bloq kind %neg-inf)
+    =/  new-els=(list @)
+      %+  turn  els
+      |=  x=@
+      ?:((fgte bloq kind x threshold) x neg-inf)
+    :-  meta.logits
+    (con data:(zeros:la meta.logits) (rep bloq new-els))
+  ::
+  ::  +apply-rep-penalty: divide-or-multiply logits at indices of recent tokens.
+  ::  Standard formulation: logit/penalty for positive logits, logit*penalty for
+  ::  negative. `penalty > 1` discourages repetition.
+  ::
+  ++  apply-rep-penalty
+    |=  [logits=tensor context=(list @ud) penalty=@rs]
+    ^-  tensor
+    =/  la  (lake rnd)
+    ?:  =(~ context)  logits
+    =/  bloq  bloq.meta.logits
+    =/  kind  kind.meta.logits
+    =/  zero  (fzero bloq kind)
+    =/  seen=(set @ud)  (~(gas in *(set @ud)) context)
+    =/  toks=(list @ud)  ~(tap in seen)
+    =/  out  logits
+    |-  ^-  tensor
+    ?~  toks  out
+    =/  idx=(list @ud)
+      ?:  =(1 (lent shape.meta.logits))  ~[i.toks]
+      ~[0 i.toks]
+    =/  val  (get-item:la out idx)
+    =/  new-val
+      ?:  (fgth bloq kind val zero)
+        (fdiv bloq kind val penalty)
+      (fmul bloq kind val penalty)
+    $(toks t.toks, out (set-item:la out idx new-val))
   ::
   ::  +generate: generate `n` tokens given a prompt.
   ::  Returns the full token sequence (prompt + generated).
@@ -417,10 +522,42 @@
     |-  ^-  (list @ud)
     ?:  =(step n)  tokens
     =/  logits  (forward tokens weights config)
-    =/  tok  (sample-token logits strategy (mix eny step))
+    =/  tok  (sample-token logits strategy tokens (mix eny step))
     $(step +(step), tokens (snoc tokens tok))
   ::
   ::  Scalar helpers
+  ::
+  ::  +hstack-2d: column-concatenate two 2D tensors. Workaround for a bug
+  ::  in lagoon's `stack`/`hstack` that iterates over the wrong dimension.
+  ::
+  ++  hstack-2d
+    |=  [a=tensor b=tensor]
+    ^-  tensor
+    =/  la  (lake rnd)
+    ?>  =(2 (lent shape.meta.a))
+    ?>  =(2 (lent shape.meta.b))
+    =/  rows  (snag 0 shape.meta.a)
+    ?>  =(rows (snag 0 shape.meta.b))
+    =/  cols-a  (snag 1 shape.meta.a)
+    =/  cols-b  (snag 1 shape.meta.b)
+    =/  out-cols  (^add cols-a cols-b)
+    =/  out  (zeros:la [~[rows out-cols] bloq.meta.a kind.meta.a ~])
+    =/  i  0
+    |-  ^-  tensor
+    ?:  =(i rows)  out
+    ::  copy a's row i, columns 0..cols-a-1
+    =/  out
+      =/  j  0
+      |-  ^-  tensor
+      ?:  =(j cols-a)  out
+      $(j +(j), out (set-item:la out ~[i j] (get-item:la a ~[i j])))
+    ::  copy b's row i, columns cols-a..out-cols-1
+    =/  out
+      =/  j  0
+      |-  ^-  tensor
+      ?:  =(j cols-b)  out
+      $(j +(j), out (set-item:la out ~[i (^add cols-a j)] (get-item:la b ~[i j])))
+    $(i +(i))
   ::
   ::  +cols: extract columns [c-start..c-end] inclusive from a 2D tensor.
   ::  Lagoon's submatrix has a Hoon gotcha where [0 0] is misparsed as
@@ -491,6 +628,36 @@
       %6  (~(add rd:math [rnd .~0]) a b)
       %5  (~(add rs:math [rnd .0]) a b)
       %4  (~(add rh:math [rnd .~~0]) a b)
+    ==
+  ++  fmul
+    |=  [=bloq =kind a=@ b=@]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+  bloq  !!
+      %7  (~(mul rq:math [rnd .~~~0]) a b)
+      %6  (~(mul rd:math [rnd .~0]) a b)
+      %5  (~(mul rs:math [rnd .0]) a b)
+      %4  (~(mul rh:math [rnd .~~0]) a b)
+    ==
+  ++  fdiv
+    |=  [=bloq =kind a=@ b=@]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+  bloq  !!
+      %7  (~(div rq:math [rnd .~~~0]) a b)
+      %6  (~(div rd:math [rnd .~0]) a b)
+      %5  (~(div rs:math [rnd .0]) a b)
+      %4  (~(div rh:math [rnd .~~0]) a b)
+    ==
+  ++  fgth
+    |=  [=bloq =kind a=@ b=@]
+    ^-  ?
+    ?>  =(%i754 kind)
+    ?+  bloq  !!
+      %7  (~(gth rq:math [rnd .~~~0]) a b)
+      %6  (~(gth rd:math [rnd .~0]) a b)
+      %5  (~(gth rs:math [rnd .0]) a b)
+      %4  (~(gth rh:math [rnd .~~0]) a b)
     ==
   ++  fgte
     |=  [=bloq =kind a=@ b=@]

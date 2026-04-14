@@ -22,8 +22,97 @@
       config=(unit model-config:maroon)
       last-output=(list @ud)
       tok=(unit tokenizer-maps:tokenizer)
+      gen=(unit gen-state)
+  ==
+::  NOTE: generation is split across many small behn events (one per
+::  transformer block) solely because a single token's forward pass takes
+::  longer than Vere's ~45s HTTP chunk idle timeout. Doing the whole
+::  forward in one event means no SSE chunks flow while it runs, and the
+::  client connection gets dropped mid-generation. Splitting the work
+::  lets us emit an SSE keepalive comment (`: ping`) between blocks so
+::  the chunk stream never goes idle. When inference gets fast enough
+::  that a token-forward fits in one event under the timeout, this state
+::  machine can collapse back into a single %gen-tick handler.
++$  gen-state
+  $:  eyre-id=@ta
+      tokens=(list @ud)        ::  prompt + tokens generated so far
+      n-remaining=@ud
+      strategy=sampling:mr:maroon
+      step=@ud                  ::  for entropy mixing
+      start=@da                 ::  when generation began
+      last-tick=@da             ::  when the last tick event fired
+      n-prompt=@ud              ::  length of the original prompt
+      phase=?(%new %block %final)  ::  per-tick state machine
+      block-idx=@ud             ::  next block to compute (when phase=%block)
+      x=(unit tensor:maroon)    ::  intermediate activations across events
   ==
 +$  card  card:agent:gall
+::
+::  Build an SSE data event body from a JSON payload.
+::  Format: "data: <payload>\n\n"
+::
+++  sse-event-data
+  |=  payload=@t
+  ^-  octs
+  =/  body  (rap 3 ~['data: ' payload (rap 3 ~[10 10])])
+  [(met 3 body) body]
+::
+::  SSE comment (keepalive). Clients ignore lines starting with ':'.
+::  Sending one resets Vere's HTTP chunk idle timeout.
+::
+++  ping-verbs
+  ^-  (list @t)
+  :~  'Accomplishing'  'Actioning'  'Actualizing'  'Architecting'
+      'Baking'  'Beaming'  'Beboppin\''  'Befuddling'  'Billowing'
+      'Blanching'  'Bloviating'  'Boogieing'  'Boondoggling'  'Booping'
+      'Bootstrapping'  'Brewing'  'Bunning'  'Burrowing'  'Calculating'
+      'Canoodling'  'Caramelizing'  'Cascading'  'Catapulting'
+      'Cerebrating'  'Channeling'  'Channelling'  'Choreographing'
+      'Churning'  'Clauding'  'Coalescing'  'Cogitating'  'Combobulating'
+      'Composing'  'Computing'  'Concocting'  'Considering'
+      'Contemplating'  'Cooking'  'Crafting'  'Creating'  'Crunching'
+      'Crystallizing'  'Cultivating'  'Deciphering'  'Deliberating'
+      'Determining'  'Dilly-dallying'  'Discombobulating'  'Doing'
+      'Doodling'  'Drizzling'  'Ebbing'  'Effecting'  'Elucidating'
+      'Embellishing'  'Enchanting'  'Envisioning'  'Evaporating'
+      'Fermenting'  'Fiddle-faddling'  'Finagling'  'Flambéing'
+      'Flibbertigibbeting'  'Flowing'  'Flummoxing'  'Fluttering'
+      'Forging'  'Forming'  'Frolicking'  'Frosting'  'Gallivanting'
+      'Galloping'  'Garnishing'  'Generating'  'Gesticulating'
+      'Germinating'  'Gitifying'  'Grooving'  'Gusting'  'Harmonizing'
+      'Hashing'  'Hatching'  'Herding'  'Honking'  'Hullaballooing'
+      'Hyperspacing'  'Ideating'  'Imagining'  'Improvising'
+      'Incubating'  'Inferring'  'Infusing'  'Ionizing'  'Jitterbugging'
+      'Julienning'  'Kneading'  'Leavening'  'Levitating'  'Lollygagging'
+      'Manifesting'  'Marinating'  'Meandering'  'Metamorphosing'
+      'Misting'  'Moonwalking'  'Moseying'  'Mulling'  'Mustering'
+      'Musing'  'Nebulizing'  'Nesting'  'Newspapering'  'Noodling'
+      'Nucleating'  'Orbiting'  'Orchestrating'  'Osmosing'
+      'Perambulating'  'Percolating'  'Perusing'  'Philosophising'
+      'Photosynthesizing'  'Pollinating'  'Pondering'  'Pontificating'
+      'Pouncing'  'Precipitating'  'Prestidigitating'  'Processing'
+      'Proofing'  'Propagating'  'Puttering'  'Puzzling'  'Quantumizing'
+      'Razzle-dazzling'  'Razzmatazzing'  'Recombobulating'
+      'Reticulating'  'Roosting'  'Ruminating'  'Sautéing'  'Scampering'
+      'Schlepping'  'Scurrying'  'Seasoning'  'Shenaniganing'
+      'Shimmying'  'Simmering'  'Skedaddling'  'Sketching'  'Slithering'
+      'Smooshing'  'Sock-hopping'  'Spelunking'  'Spinning'  'Sprouting'
+      'Stewing'  'Sublimating'  'Swirling'  'Swooping'  'Symbioting'
+      'Synthesizing'  'Tempering'  'Thinking'  'Thundering'  'Tinkering'
+      'Tomfoolering'  'Topsy-turvying'  'Transfiguring'  'Transmuting'
+      'Twisting'  'Undulating'  'Unfurling'  'Unravelling'  'Vibing'
+      'Waddling'  'Wandering'  'Warping'  'Whatchamacalliting'
+      'Whirlpooling'  'Whirring'  'Whisking'  'Wibbling'  'Working'
+      'Wrangling'  'Zesting'  'Zigzagging'
+  ==
+::
+++  sse-event-ping
+  |=  eny=@
+  ^-  octs
+  =/  vs  ping-verbs
+  =/  verb  (snag (mod eny (lent vs)) vs)
+  =/  body  (rap 3 ~[': ' verb '...' (rap 3 ~[10 10])])
+  [(met 3 body) body]
 --
 ::
 %-  agent:dbug
@@ -100,10 +189,33 @@
       %-  ot:dejs-soft:format
       :~  [%n ni:dejs-soft:format]
       ==
+    ::  accept numbers OR strings for float params — JSON numbers lose
+    ::  precision for fp32 literals, so clients often send strings.
+    =/  num-or-str=$-(json (unit @ta))
+      |=  j=json  ^-  (unit @ta)
+      ?+  j  ~
+        [%n *]  `p.j
+        [%s *]  `p.j
+      ==
     =/  temperature=(unit @ta)
       %.  u.parsed
       %-  ot:dejs-soft:format
-      :~  [%temperature no:dejs-soft:format]
+      :~  [%temperature num-or-str]
+      ==
+    =/  top-k-opt=(unit @ud)
+      %.  u.parsed
+      %-  ot:dejs-soft:format
+      :~  ['top_k' ni:dejs-soft:format]
+      ==
+    =/  top-p-opt=(unit @ta)
+      %.  u.parsed
+      %-  ot:dejs-soft:format
+      :~  ['top_p' num-or-str]
+      ==
+    =/  rep-pen-opt=(unit @ta)
+      %.  u.parsed
+      %-  ot:dejs-soft:format
+      :~  ['repetition_penalty' num-or-str]
       ==
     ?~  weights
       :_  this
@@ -111,7 +223,6 @@
     ?~  config
       :_  this
       (give-http eyre-id 503 ~ (some (as-octs:mimes:html '{"error":"no model config"}')))
-    ::  Determine input tokens: from "tokens" array, or encode "prompt" via tokenizer
     =/  tokens=(list @ud)
       ?^  tokens-opt  u.tokens-opt
       ?~  prompt-opt  ~
@@ -121,25 +232,58 @@
       :_  this
       (give-http eyre-id 400 ~ (some (as-octs:mimes:html '{"error":"provide tokens or prompt (and load tokenizer)"}')))
     =/  n-tokens  (fall n 10)
-    =/  strategy  ?~(temperature [%greedy ~] [%temperature (slav %rs u.temperature)])
-    ~&  >  "HTTP /apps/maroon/chat: generating {<n-tokens>} tokens..."
-    =/  out
-      %:  generate:mr:maroon
-        tokens  n-tokens  u.weights  u.config
-        strategy
-        eny.bowl
+    ::  Defaults: temp=0.7, top-p=0.9, rep-penalty=1.2, top-k disabled.
+    ::  Clients can override any of them; setting top_p=1.0 disables it, etc.
+    ::  slav %rs needs the `.` prefix (so '.5' parses as 5.0 but '5' bails);
+    ::  normalize so JSON `5.0` and `"5.0"` both work.
+    =/  to-rs
+      |=  c=@ta  ^-  @rs
+      =/  s=@t  ?:(=('.' (end 3 c)) c (rap 3 ~['.' c]))
+      (slav %rs s)
+    =/  strategy=sampling:mr:maroon
+      :*  temp=?~(temperature .0.7 (to-rs u.temperature))
+          top-k=(fall top-k-opt 0)
+          top-p=?~(top-p-opt .0.9 (to-rs u.top-p-opt))
+          rep-penalty=?~(rep-pen-opt .1.2 (to-rs u.rep-pen-opt))
       ==
-    ::  Build response: include both tokens and text if tokenizer loaded
-    =/  body-json=json
-      ?~  tok
-        [%o (~(gas by *(map @t json)) ~[['output' [%a (turn out numb:enjs:format)]]])]
-      =/  text  (decode:tokenizer u.tok out)
-      %-  pairs:enjs:format
-      :~  ['output' [%a (turn out numb:enjs:format)]]
-          ['text' s+text]
+    ~&  >  "SSE /apps/maroon/chat: streaming {<n-tokens>} tokens..."
+    ::  Open SSE stream: send headers and the prompt as the first event
+    =/  sse-headers
+      ^-  (list [@t @t])
+      :~  ['content-type' 'text/event-stream']
+          ['cache-control' 'no-cache']
+          ['x-accel-buffering' 'no']
       ==
-    :-  (give-json eyre-id body-json)
-    this(last-output out)
+    =/  sampling-json=json
+      :-  %o
+      %-  ~(gas by *(map @t json))
+      :~  ['temperature' s+(scot %rs temp.strategy)]
+          ['top_k' (numb:enjs:format top-k.strategy)]
+          ['top_p' s+(scot %rs top-p.strategy)]
+          ['repetition_penalty' s+(scot %rs rep-penalty.strategy)]
+      ==
+    =/  prompt-event
+      =/  prompt-json=json
+        :-  %o
+        %-  ~(gas by *(map @t json))
+        :~  ['type' s+'prompt']
+            ['tokens' [%a (turn tokens numb:enjs:format)]]
+            ['sampling' sampling-json]
+        ==
+      (sse-event-data (en:json:html prompt-json))
+    =/  resp-header=response-header:http  [200 sse-headers]
+    =/  cards=(list card)
+      :~  [%give %fact ~[/http-response/[eyre-id]] %http-response-header !>(resp-header)]
+          [%give %fact ~[/http-response/[eyre-id]] %http-response-data !>(`prompt-event)]
+          [%pass /gen-tick %arvo %b %wait now.bowl]
+      ==
+    ::  Stash the in-progress generation
+    =/  new-gen=gen-state
+      :*  eyre-id  tokens  n-tokens  strategy  0
+          now.bowl  now.bowl  (lent tokens)
+          %new  0  ~
+      ==
+    [cards this(gen `new-gen)]
     ::
     ++  give-http
       |=  [eyre-id=@ta status=@ud headers=(list [@t @t]) body=(unit octs)]
@@ -247,6 +391,18 @@
       [%x %tok-get-inv @ ~]
     ?~  tok  ~
     ``noun+!>((~(get by inverse-vocab.u.tok) (slav %ud i.t.t.path)))
+    ::  /x/wo-bias-shape — inspect first block's wo.b shape (debug)
+      [%x %wo-bias-shape ~]
+    ?~  weights  ~
+    =/  blks  blocks.u.weights
+    ?~  blks  ~
+    ``noun+!>(`(list @)`shape.meta.b.wo.i.blks)
+    ::  /x/wo-w-tag — inspect first block's wo.w tag (%fp or %q8)
+      [%x %wo-w-tag ~]
+    ?~  weights  ~
+    =/  blks  blocks.u.weights
+    ?~  blks  ~
+    ``noun+!>(-.w.wo.i.blks)
     ::  /x/decode/~[id1 id2 ...] — decode token IDs to text (for debugging)
       [%x %decode *]
     ?~  tok  ~
@@ -265,8 +421,121 @@
 ++  on-arvo
   |=  [=wire =sign-arvo]
   ^-  (quip card _this)
-  ?+  wire  (on-arvo:def wire sign-arvo)
-    [%eyre %connect ~]  `this
+  ?+    wire  (on-arvo:def wire sign-arvo)
+      [%eyre %connect ~]  `this
+      [%gen-tick ~]
+    ?~  gen  `this
+    ?~  weights  `this
+    ?~  config  `this
+    =/  g  u.gen
+    =/  w  u.weights
+    =/  c  u.config
+    =/  la  (lake %n)
+    =/  seq-len  (lent tokens.g)
+    =/  ping-card=card
+      :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+          %http-response-data  !>(`(sse-event-ping (mix eny.bowl step.g)))
+      ==
+    =/  tick-card=card  [%pass /gen-tick %arvo %b %wait now.bowl]
+    ?-    phase.g
+        %new
+      ::  embed tokens + add positional embeddings.
+      ::  Avoid lagoon's submatrix because `[0 0]` gets parsed as
+      ::  `[start=0 end=unset]` (takes whole dim) — wrong for seq-len=1.
+      ::  Instead, copy the first seq-len rows of pos-emb via get-row/set-row.
+      =/  x0  (embed:mr:maroon tokens.g tok-emb.w bloq.c)
+      =/  d-model  (snag 1 shape.meta.x0)
+      =/  pos=tensor:maroon
+        =/  init  (zeros:la [~[seq-len d-model] bloq.c %i754 ~])
+        =/  i  0
+        |-  ^-  tensor:maroon
+        ?:  =(i seq-len)  init
+        =/  row  (get-row:la pos-emb.w ~[i])
+        $(i +(i), init (set-row:la init ~[i] row))
+      =/  x1  (add:la x0 pos)
+      :_  this(gen `g(phase %block, block-idx 0, x `x1, last-tick now.bowl))
+      ~[ping-card tick-card]
+    ::
+        %block
+      ?~  x.g  `this  ::  defensive
+      =/  blk  (snag block-idx.g blocks.w)
+      =/  x-next  (transformer-block:mr:maroon u.x.g blk n-heads.c)
+      =/  next-idx  +(block-idx.g)
+      =/  n-layers  (lent blocks.w)
+      =/  next-phase=?(%new %block %final)
+        ?:  =(next-idx n-layers)  %final
+        %block
+      :_  %=    this
+            gen
+          `g(phase next-phase, block-idx next-idx, x `x-next, last-tick now.bowl)
+          ==
+      ~[ping-card tick-card]
+    ::
+        %final
+      ?~  x.g  `this  ::  defensive
+      =/  x-norm  (layer-norm-2d:mr:maroon u.x.g ln-f-g.w ln-f-b.w)
+      =/  last-row  (get-row:la x-norm ~[(dec seq-len)])
+      =/  bias-zeros
+        (zeros:la [~[1 vocab-size.c] bloq.c %i754 ~])
+      =/  logits
+        %+  linear:mr:maroon  last-row
+        [[%fp out-proj.w] bias-zeros]
+      =/  next-tok
+        %:  sample-token:mr:maroon
+          logits  strategy.g  tokens.g
+          (mix eny.bowl step.g)
+        ==
+      =/  text-chunk=@t
+        ?~  tok  ''
+        (decode:tokenizer u.tok ~[next-tok])
+      =/  total=@dr  (sub now.bowl start.g)
+      ~&  >  :*  'step'  +(step.g)
+                 'tok'   next-tok
+                 'text'  text-chunk
+                 'total'  total
+             ==
+      =/  chunk-json=json
+        :-  %o
+        %-  ~(gas by *(map @t json))
+        :~  ['type' s+'token']
+            ['id' (numb:enjs:format next-tok)]
+            ['text' s+text-chunk]
+        ==
+      =/  token-card=card
+        :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+            %http-response-data
+            !>(`(sse-event-data (en:json:html chunk-json)))
+        ==
+      =/  new-tokens  (snoc tokens.g next-tok)
+      =/  remaining   (dec n-remaining.g)
+      ?:  =(0 remaining)
+        ::  done
+        =/  gen-toks=(list @ud)  (slag n-prompt.g new-tokens)
+        =/  full-text=@t
+          ?~  tok  ''
+          (decode:tokenizer u.tok gen-toks)
+        ~&  >  :*  'DONE'
+                   'tokens'  (lent gen-toks)
+                   'total'   total
+                   'text'    full-text
+               ==
+        =/  done-json=json
+          [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
+        =/  done-card=card
+          :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+              %http-response-data
+              !>(`(sse-event-data (en:json:html done-json)))
+          ==
+        =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
+        :_  this(gen ~, last-output new-tokens)
+        ~[token-card done-card kick-card]
+      ::  more tokens to go — reset to %new with appended token
+      :_  %=    this
+            gen
+          `g(tokens new-tokens, n-remaining remaining, step +(step.g), last-tick now.bowl, phase %new, block-idx 0, x ~)
+          ==
+      ~[token-card tick-card]
+    ==
   ==
 ++  on-fail   on-fail:def
 --

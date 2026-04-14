@@ -39,6 +39,10 @@ struct Args {
     /// Output precision: 5=float32 (@rs), 4=float16 (@rh)
     #[arg(long, default_value_t = 5)]
     bloq: u8,
+
+    /// Int8-quantize block weights for ~4x size reduction.
+    #[arg(long)]
+    quantize: bool,
 }
 
 /// Build the `%i754` atom used as `kind` in the ray meta.
@@ -46,6 +50,84 @@ struct Args {
 fn kind_i754() -> Atom {
     // "i754" as bytes, little-endian
     Atom::from(vec![b'i', b'7', b'5', b'4'])
+}
+
+fn kind_uint() -> Atom {
+    Atom::from(vec![b'u', b'i', b'n', b't'])
+}
+
+/// Build a `%fp` or `%q8` tag atom.
+fn tag_fp() -> Atom { Atom::from(vec![b'f', b'p']) }
+fn tag_q8() -> Atom { Atom::from(vec![b'q', b'8']) }
+
+/// Build a uint8 ray (bloq=3, kind=%uint) from raw bytes.
+fn build_ray_u8(bytes: &[u8], shape: &[usize]) -> Noun {
+    let n_elements = bytes.len();
+    let mut data_bytes = Vec::with_capacity(n_elements + 1);
+    data_bytes.extend_from_slice(bytes);
+    data_bytes.push(0x01);  // MSB pin
+
+    let data = Atom::from(data_bytes);
+
+    let mut shape_noun = Noun::Atom(Atom::from(0u8));
+    for &dim in shape.iter().rev() {
+        shape_noun = Noun::Cell(Cell::from([
+            Noun::Atom(Atom::from(dim as u64)),
+            shape_noun,
+        ]));
+    }
+
+    let meta = Noun::Cell(Cell::from([
+        shape_noun,
+        Noun::Atom(Atom::from(3u64)),
+        Noun::Atom(Noun::from(kind_uint()).into_atom().unwrap()),
+        Noun::Atom(Atom::from(0u8)),
+    ]));
+
+    Noun::Cell(Cell::from([meta, Noun::Atom(data)]))
+}
+
+/// Encode a Hoon @rs (float32) atom for the scale.
+fn f32_to_atom(f: f32) -> Atom {
+    let bits = f.to_bits();
+    let bytes = bits.to_le_bytes().to_vec();
+    Atom::from(bytes)
+}
+
+/// Quantize an fp32 tensor to int8 + scale; emit a [%q8 ray scale] noun.
+/// Symmetric per-tensor: scale = max(abs(W)) / 127.
+fn make_q8_weight(f32_bytes: &[u8], shape: &[usize]) -> Noun {
+    assert_eq!(f32_bytes.len() % 4, 0);
+    let n = f32_bytes.len() / 4;
+
+    // find max abs
+    let mut max_abs: f32 = 0.0;
+    for chunk in f32_bytes.chunks_exact(4) {
+        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let a = v.abs();
+        if a > max_abs { max_abs = a; }
+    }
+    let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+
+    // quantize each element to int8 (stored as u8 two's complement)
+    let mut q_bytes = Vec::with_capacity(n);
+    for chunk in f32_bytes.chunks_exact(4) {
+        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let q = (v / scale).round().clamp(-128.0, 127.0) as i8;
+        q_bytes.push(q as u8);
+    }
+
+    let ray = build_ray_u8(&q_bytes, shape);
+    Noun::Cell(Cell::from([
+        Noun::Atom(tag_q8()),
+        ray,
+        Noun::Atom(f32_to_atom(scale)),
+    ]))
+}
+
+/// Wrap a weight ray as [%fp r=ray].
+fn wrap_fp(ray: Noun) -> Noun {
+    Noun::Cell(Cell::from([Noun::Atom(tag_fp()), ray]))
 }
 
 /// Convert a flat slice of float32 bytes + shape to a Lagoon ray noun.
@@ -130,17 +212,59 @@ fn tensor_to_ray(
 }
 
 /// Helper: build a linear-weights noun [w b] from two tensors.
+/// `w` is wrapped as [%fp r=ray] or [%q8 r=ray scale=@rs].
 fn linear(
     tensors: &SafeTensors,
     w_name: &str,
     b_name: &str,
     bloq: u8,
+    quantize: bool,
 ) -> Result<Noun> {
-    let w = tensor_to_ray(tensors, w_name, bloq)?;
-    let b_flat = tensor_to_ray(tensors, b_name, bloq)?;
-    // Bias in linear-weights expects shape [1 d_out]; reshape if 1D.
-    // We keep as-is for now — the Hoon code accepts [d_out] or [1 d_out].
-    Ok(Noun::Cell(Cell::from([w, b_flat])))
+    let w_tensor = tensors.tensor(w_name)?;
+    let w_shape = w_tensor.shape().to_vec();
+    let w_bytes = bytes_as_f32_vec(&w_tensor)?;
+
+    let w_noun = if quantize {
+        make_q8_weight(&w_bytes, &w_shape)
+    } else {
+        wrap_fp(build_ray_f32(&w_bytes, &w_shape, bloq))
+    };
+
+    // Bias: reshape to [1 d_out] so it nests with [1 d_out] rows in add-bias.
+    let b_tensor = tensors.tensor(b_name)?;
+    let mut b_shape = b_tensor.shape().to_vec();
+    if b_shape.len() == 1 {
+        b_shape.insert(0, 1);
+    }
+    let b_bytes = bytes_as_f32_vec(&b_tensor)?;
+    let b_ray = build_ray_f32(&b_bytes, &b_shape, bloq);
+    Ok(Noun::Cell(Cell::from([w_noun, b_ray])))
+}
+
+/// Read a tensor as f32 bytes regardless of input dtype.
+fn bytes_as_f32_vec(tensor: &safetensors::tensor::TensorView) -> Result<Vec<u8>> {
+    match tensor.dtype() {
+        Dtype::F32 => Ok(tensor.data().to_vec()),
+        Dtype::F16 => {
+            let mut out = Vec::with_capacity(tensor.data().len() * 2);
+            for chunk in tensor.data().chunks_exact(2) {
+                let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let v = half::f16::from_bits(raw).to_f32();
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Ok(out)
+        }
+        Dtype::BF16 => {
+            let mut out = Vec::with_capacity(tensor.data().len() * 2);
+            for chunk in tensor.data().chunks_exact(2) {
+                let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let v = half::bf16::from_bits(raw).to_f32();
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Ok(out)
+        }
+        other => bail!("unsupported dtype: {:?}", other),
+    }
 }
 
 /// Slice a [d_model, 3*d_model] c_attn.weight into Q, K, V each [d_model, d_model].
@@ -165,6 +289,7 @@ fn split_gpt2_qkv(
     prefix: &str,
     d_model: usize,
     bloq: u8,
+    quantize: bool,
 ) -> Result<(Noun, Noun, Noun)> {
     let w_name = format!("{}.attn.c_attn.weight", prefix);
     let b_name = format!("{}.attn.c_attn.bias", prefix);
@@ -221,24 +346,20 @@ fn split_gpt2_qkv(
     let shape_w = vec![rows, d_model];
     let shape_b = vec![1, d_model];
 
-    let wq = Noun::Cell(Cell::from([
-        build_ray_f32(&wq_w, &shape_w, bloq),
-        build_ray_f32(&wq_b, &shape_b, bloq),
-    ]));
-    let wk = Noun::Cell(Cell::from([
-        build_ray_f32(&wk_w, &shape_w, bloq),
-        build_ray_f32(&wk_b, &shape_b, bloq),
-    ]));
-    let wv = Noun::Cell(Cell::from([
-        build_ray_f32(&wv_w, &shape_w, bloq),
-        build_ray_f32(&wv_b, &shape_b, bloq),
-    ]));
-
-    Ok((wq, wk, wv))
+    let mk = |w: &[u8], b: &[u8]| -> Noun {
+        let wn = if quantize {
+            make_q8_weight(w, &shape_w)
+        } else {
+            wrap_fp(build_ray_f32(w, &shape_w, bloq))
+        };
+        let bn = build_ray_f32(b, &shape_b, bloq);
+        Noun::Cell(Cell::from([wn, bn]))
+    };
+    Ok((mk(&wq_w, &wq_b), mk(&wk_w, &wk_b), mk(&wv_w, &wv_b)))
 }
 
 /// Build the model-weights noun for a GPT-2 model.
-fn convert_gpt2(tensors: &SafeTensors, bloq: u8) -> Result<Noun> {
+fn convert_gpt2(tensors: &SafeTensors, bloq: u8, quantize: bool) -> Result<Noun> {
     // Read shapes to infer config
     let tok = tensors.tensor("wte.weight").or_else(|_| tensors.tensor("transformer.wte.weight"))
         .context("missing token embedding")?;
@@ -270,20 +391,20 @@ fn convert_gpt2(tensors: &SafeTensors, bloq: u8) -> Result<Noun> {
     let mut blocks = Noun::Atom(Atom::from(0u8)); // null
     for i in (0..n_layers).rev() {
         let prefix = p(&format!("h.{}", i));
-        let (wq, wk, wv) = split_gpt2_qkv(tensors, &prefix, d_model, bloq)?;
+        let (wq, wk, wv) = split_gpt2_qkv(tensors, &prefix, d_model, bloq, quantize)?;
         let wo = linear(tensors,
             &format!("{}.attn.c_proj.weight", prefix),
-            &format!("{}.attn.c_proj.bias", prefix), bloq)?;
+            &format!("{}.attn.c_proj.bias", prefix), bloq, quantize)?;
         let ln1_g = tensor_to_ray(tensors, &format!("{}.ln_1.weight", prefix), bloq)?;
         let ln1_b = tensor_to_ray(tensors, &format!("{}.ln_1.bias", prefix), bloq)?;
         let ln2_g = tensor_to_ray(tensors, &format!("{}.ln_2.weight", prefix), bloq)?;
         let ln2_b = tensor_to_ray(tensors, &format!("{}.ln_2.bias", prefix), bloq)?;
         let ff1 = linear(tensors,
             &format!("{}.mlp.c_fc.weight", prefix),
-            &format!("{}.mlp.c_fc.bias", prefix), bloq)?;
+            &format!("{}.mlp.c_fc.bias", prefix), bloq, quantize)?;
         let ff2 = linear(tensors,
             &format!("{}.mlp.c_proj.weight", prefix),
-            &format!("{}.mlp.c_proj.bias", prefix), bloq)?;
+            &format!("{}.mlp.c_proj.bias", prefix), bloq, quantize)?;
 
         // block-weights = [wq wk wv wo ln1_g ln1_b ln2_g ln2_b ff1 ff2]
         let block = Noun::Cell(Cell::from([
@@ -300,9 +421,27 @@ fn convert_gpt2(tensors: &SafeTensors, bloq: u8) -> Result<Noun> {
     // Output projection: GPT-2 ties with token embeddings. We need [d_model, vocab_size].
     // The wte.weight is [vocab_size, d_model], so we need to transpose.
     // For now, just reuse wte.weight with a shape swap — this is INCORRECT because
-    // the actual data is in the wrong order. TODO: proper transpose.
-    let out_proj = tensor_to_ray(tensors, &p("wte.weight"), bloq)?;
-    eprintln!("  final layers done (note: out_proj is shape-only, not transposed)");
+    // GPT-2 ties output projection with token embeddings.
+    // wte.weight is [vocab_size, d_model]; for output projection we need
+    // [d_model, vocab_size] so we must transpose.
+    let wte = tensors.tensor(&p("wte.weight"))?;
+    let wte_shape = wte.shape();
+    assert_eq!(wte_shape.len(), 2);
+    let v = wte_shape[0];   // vocab_size
+    let dm = wte_shape[1];  // d_model
+    let wte_f32 = bytes_as_f32_vec(&wte)?;
+
+    // transpose: out[d_m, v] = wte[v, d_m]
+    let mut transposed = vec![0u8; wte_f32.len()];
+    for i in 0..v {
+        for j in 0..dm {
+            let src = (i * dm + j) * 4;
+            let dst = (j * v + i) * 4;
+            transposed[dst..dst + 4].copy_from_slice(&wte_f32[src..src + 4]);
+        }
+    }
+    let out_proj = build_ray_f32(&transposed, &[dm, v], bloq);
+    eprintln!("  final layers done");
 
     // model-weights = [tok-emb pos-emb blocks ln-f-g ln-f-b out-proj]
     Ok(Noun::Cell(Cell::from([
@@ -321,7 +460,7 @@ fn main() -> Result<()> {
     eprintln!("loaded {} tensors from {:?}", tensors.names().len(), args.input);
 
     let weights = match args.arch.as_str() {
-        "gpt2" => convert_gpt2(&tensors, args.bloq)?,
+        "gpt2" => convert_gpt2(&tensors, args.bloq, args.quantize)?,
         other => bail!("unsupported architecture: {}", other),
     };
 

@@ -171,6 +171,15 @@
   ::  Returns the quotient of two floating-point rays
   ::  Source
   ++  div  div:(lake rnd)
+  ::    +eml:  [$ray $ray] -> $ray
+  ::
+  ::  Returns exp(x) - ln(y) elementwise across two floating-point rays.
+  ::  Source
+  ++  eml
+    ~/  %eml
+    |=  [a=ray:ls b=ray:ls]
+    ^-  ray
+    (bin-op:la a b (fun-scalar meta.a %eml))
   ::    +fma:  [$ray $ray $ray] -> $ray
   ::
   ::  Returns the fused multiply-add of three floating-point rays
@@ -301,6 +310,133 @@
   ::  Source
   ++  cbt  cbrt
   ::
+  ::  Transformer activation functions
+  ::  Composed from ray primitives; each has a ~/hint for future jetting.
+  ::
+  ::    +relu: $ray -> $ray
+  ::
+  ::  Returns max(0, x) elementwise.
+  ::  Source
+  ++  relu
+    ~/  %relu
+    |=  a=ray:ls
+    ^-  ray
+    =,  (lake rnd)
+    =/  z  (zeros:la meta.a)
+    =/  mask  (gth a z)
+    (mul a mask)
+  ::    +sigmoid: $ray -> $ray
+  ::
+  ::  Returns 1 / (1 + exp(-x)) elementwise.
+  ::  Source
+  ++  sigmoid
+    ~/  %sigmoid
+    |=  a=ray:ls
+    ^-  ray
+    =,  (lake rnd)
+    =/  one  (ones:la meta.a)
+    (div one (add one (exp (neg a))))
+  ::    +tanh: $ray -> $ray
+  ::
+  ::  Returns hyperbolic tangent: (exp(2x) - 1) / (exp(2x) + 1).
+  ::  Source
+  ++  tanh
+    ~/  %tanh
+    |=  a=ray:ls
+    ^-  ray
+    =,  (lake rnd)
+    =/  one  (ones:la meta.a)
+    =/  e2x  (exp (add a a))
+    (div (sub e2x one) (add e2x one))
+  ::    +gelu: $ray -> $ray
+  ::
+  ::  GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+  ::  Source
+  ++  gelu
+    ~/  %gelu
+    |=  a=ray:ls
+    ^-  ray
+    =,  (lake rnd)
+    =/  one  (ones:la meta.a)
+    =/  x3  (mul (mul a a) a)
+    =/  inner  (add a (mul-scalar:la x3 (fcon bloq.meta.a kind.meta.a %gelu-coef)))
+    =/  th  (tanh (mul-scalar:la inner (fcon bloq.meta.a kind.meta.a %sqrt2pi)))
+    (mul-scalar:la (mul a (add one th)) (fcon bloq.meta.a kind.meta.a %half))
+  ::    +softmax: $ray -> $ray
+  ::
+  ::  Softmax over flat ray: exp(x - max(x)) / sum(exp(x - max(x)))
+  ::  Numerically stable via max subtraction.
+  ::  Source
+  ++  softmax
+    ~/  %softmax
+    |=  a=ray:ls
+    ^-  ray
+    =,  (lake rnd)
+    ::  subtract max for numerical stability
+    =/  mx  (max a)
+    =/  mx-idx  (reap (lent shape.meta.mx) 0)
+    =/  shifted  (sub-scalar a (get-item mx mx-idx))
+    =/  exps  (exp shifted)
+    =/  sm  (cumsum exps)
+    =/  sm-idx  (reap (lent shape.meta.sm) 0)
+    (div-scalar exps (get-item sm sm-idx))
+  ::    +layer-norm: [$ray $ray $ray] -> $ray
+  ::
+  ::  Layer normalization: gamma * (x - mean) / sqrt(var + eps) + beta
+  ::  gamma and beta are learnable parameter rays matching input shape.
+  ::  Source
+  ++  layer-norm
+    ~/  %layer-norm
+    |=  [x=ray:ls gamma=ray:ls beta=ray:ls]
+    ^-  ray
+    =/  n-elements  (roll shape.meta.x ^mul)
+    =,  (lake rnd)
+    =/  zero-idx  (reap (lent shape.meta.x) 0)
+    =/  n-val  (fsun bloq.meta.x kind.meta.x n-elements)
+    ::  mean = sum(x) / n
+    =/  mean-val
+      =/  sum-raw  (get-item:la (cumsum:la x) zero-idx)
+      (fdiv bloq.meta.x kind.meta.x sum-raw n-val)
+    =/  mu  (fill:la meta.x mean-val)
+    =/  diff  (sub x mu)
+    ::  var = sum((x - mean)^2) / n
+    =/  var-val
+      =/  sq-sum  (get-item:la (cumsum:la (mul diff diff)) zero-idx)
+      (fdiv bloq.meta.x kind.meta.x sq-sum n-val)
+    =/  eps-val  (fcon bloq.meta.x kind.meta.x %eps)
+    =/  std  (sqrt (add-scalar:la (fill:la meta.x var-val) eps-val))
+    ::  gamma * (x - mean) / std + beta
+    (add (mul gamma (div diff std)) beta)
+  ::
+  ::  Precision-aware float constants and scalar ops
+  ::
+  ++  fcon
+    |=  [=bloq =kind con=@tas]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+    con  !!
+        %half
+      ?+(bloq !! %7 .~~~0.5, %6 .~0.5, %5 .0.5, %4 .~~0.5)
+        %gelu-coef
+      ?+(bloq !! %7 .~~~0.044715, %6 .~0.044715, %5 .0.044715, %4 .~~0.04474)
+        %sqrt2pi
+      ?+(bloq !! %7 .~~~0.7978845608028654, %6 .~0.7978845608028654, %5 .0.79788456, %4 .~~0.7979)
+        %eps
+      ?+(bloq !! %7 .~~~1e-5, %6 .~1e-5, %5 .1e-5, %4 .~~0.001)
+        %neg-inf
+      ?+(bloq !! %7 `@rq`0xffff.0000.0000.0000.0000.0000.0000.0000, %6 `@rd`0xfff0.0000.0000.0000, %5 `@rs`0xff80.0000, %4 `@rh`0xfc00)
+    ==
+  ++  fsun
+    |=  [=bloq =kind n=@ud]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+(bloq !! %7 (~(sun rq rnd) n), %6 (~(sun rd rnd) n), %5 (~(sun rs rnd) n), %4 (~(sun rh rnd) n))
+  ++  fdiv
+    |=  [=bloq =kind a=@ b=@]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+(bloq !! %7 (~(div rq rnd) a b), %6 (~(div rd rnd) a b), %5 (~(div rs rnd) a b), %4 (~(div rh rnd) a b))
+  ::
   +$  unary-ops   $?  %neg
                       %factorial
                       %exp
@@ -395,7 +531,8 @@
       ==  ::  bloq
     ==  ::  kind
   ::
-  +$  binary-ops  $?  %pow-n
+  +$  binary-ops  $?  %eml
+                      %pow-n
                       %pow
                   ==
   ::
@@ -406,6 +543,7 @@
         %int2  !!
         %uint
       ?-  fun
+        %eml        !!
         %pow        (fun-scalar meta %pow-n)
         %pow-n      |=([x=@u n=@u] ^-(@u ?:(=(0 n) 1 =/(p x |-(?:((^lth n 2) p $(n (dec n), p (^mul p x))))))))
       ==  ::  fun
@@ -414,21 +552,25 @@
       ?+    bloq.meta  !!
           %7
         ?-  fun
+          %eml        ~(eml rq:math [rnd rtol])
           %pow-n      ~(pow-n rq:math [rnd rtol])
           %pow        ~(pow rq:math [rnd rtol])
         ==  ::  fun
           %6
         ?-  fun
+          %eml        ~(eml rd:math [rnd rtol])
           %pow-n      ~(pow-n rd:math [rnd rtol])
           %pow        ~(pow rd:math [rnd rtol])
         ==  ::  fun
           %5
         ?-  fun
+          %eml        ~(eml rs:math [rnd rtol])
           %pow-n      ~(pow-n rs:math [rnd rtol])
           %pow        ~(pow rs:math [rnd rtol])
         ==  ::  fun
           %4
         ?-  fun
+          %eml        ~(eml rh:math [rnd rtol])
           %pow-n      ~(pow-n rh:math [rnd rtol])
           %pow        ~(pow rh:math [rnd rtol])
         ==  ::  fun

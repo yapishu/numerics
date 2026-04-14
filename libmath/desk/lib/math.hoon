@@ -3,8 +3,10 @@
 ::
 ::  Pure Hoon implementations of (often naive) formally correct algorithms.
 ::
+~%  %math  ..part  ~
 |%
 ++  rs
+  ~/  %rs
   ^|
   |_  $:  r=$?(%n %u %d %z)   :: round nearest, up, down, to zero
           rtol=_.1e-5         :: relative tolerance for precision of operations
@@ -595,7 +597,11 @@
     |=  x=@rs  ^-  @rs
     ?.  (gte (abs x) .1)
       ?:  =(.0 x)  ^~((mul pi .0.5))
-      (atan (div (sqt (abs (sub .1 (mul x x)))) x))
+      ::  atan(sqrt(1-x^2)/x) gives principal value;
+      ::  add pi for negative x to get correct quadrant
+      =/  r  (atan (div (sqt (abs (sub .1 (mul x x)))) x))
+      ?:  (sig x)  r
+      (add r pi)
     ?:  =(.1 x)   .0
     ?:  =(.-1 x)  pi
     ~|([%acos-out-of-bounds x] !!)
@@ -731,6 +737,19 @@
   ++  log-2
     |=  z=@rs  ^-  @rs
     (div (log z) log2)
+  ::    +eml:  [@rs @rs] -> @rs
+  ::
+  ::  Returns exp(x) - ln(y) for floating-point atoms.
+  ::    Examples
+  ::      > (eml .0 .1)
+  ::      .1
+  ::      > (eml .1 e)
+  ::      .1.7182808
+  ::  Source
+  ++  eml
+    ~/  %eml
+    |=  [x=@rs y=@rs]  ^-  @rs
+    (sub (exp x) (log y))
   ::    +pow:  [@rs @rs] -> @rs
   ::
   ::  Returns the power of a floating-point atom to a floating-point exponent.
@@ -893,6 +912,7 @@
   --
 ::  double precision
 ++  rd
+  ~/  %rd
   ^|
   |_  $:  r=$?(%n %u %d %z)   :: round nearest, up, down, to zero
           rtol=_.~1e-10       :: relative tolerance for precision of operations
@@ -1470,7 +1490,11 @@
     |=  x=@rd  ^-  @rd
     ?.  (gte (abs x) .~1)
       ?:  =(.~0 x)  ^~((mul pi .~0.5))
-      (atan (div (sqt (abs (sub .~1 (mul x x)))) x))
+      ::  atan(sqrt(1-x^2)/x) gives principal value;
+      ::  add pi for negative x to get correct quadrant
+      =/  r  (atan (div (sqt (abs (sub .~1 (mul x x)))) x))
+      ?:  (sig x)  r
+      (add r pi)
     ?:  =(.~1 x)   .~0
     ?:  =(.~-1 x)  pi
     ~|([%acos-out-of-bounds x] !!)
@@ -1600,6 +1624,19 @@
   ++  log-2
     |=  z=@rd  ^-  @rd
     (div (log z) log2)
+  ::    +eml:  [@rd @rd] -> @rd
+  ::
+  ::  Returns exp(x) - ln(y) for floating-point atoms.
+  ::    Examples
+  ::      > (eml .~0 .~1)
+  ::      .~1
+  ::      > (eml .~1 e)
+  ::      .~1.718281828459045
+  ::  Source
+  ++  eml
+    ~/  %eml
+    |=  [x=@rd y=@rd]  ^-  @rd
+    (sub (exp x) (log y))
   ::    +pow:  [@rd @rd] -> @rd
   ::
   ::  Returns the power of a floating-point atom to a floating-point exponent.
@@ -1762,6 +1799,7 @@
   --
 ::  half precision
 ++  rh
+  ~/  %rh
   ^|
   |_  $:  r=$?(%n %u %d %z)   :: round nearest, up, down, to zero
           rtol=_.~~1e-2       :: relative tolerance for precision of operations
@@ -2336,7 +2374,11 @@
     |=  x=@rh  ^-  @rh
     ?.  (gte (abs x) .~~1)
       ?:  =(.~~0 x)  ^~((mul pi .~~0.5))
-      (atan (div (sqt (abs (sub .~~1 (mul x x)))) x))
+      ::  atan(sqrt(1-x^2)/x) gives principal value;
+      ::  add pi for negative x to get correct quadrant
+      =/  r  (atan (div (sqt (abs (sub .~~1 (mul x x)))) x))
+      ?:  (sig x)  r
+      (add r pi)
     ?:  =(.~~1 x)   .~~0
     ?:  =(.~~-1 x)  pi
     ~|([%acos-out-of-bounds x] !!)
@@ -2453,6 +2495,16 @@
   ++  log-2
     |=  z=@rh  ^-  @rh
     (div (log z) log2)
+  ::    +eml:  [@rh @rh] -> @rh
+  ::
+  ::  Returns exp(x) - ln(y) for floating-point atoms.
+  ::    Examples
+  ::      TODO
+  ::  Source
+  ++  eml
+    ~/  %eml
+    |=  [x=@rh y=@rh]  ^-  @rh
+    (sub (exp x) (log y))
   ::    +pow:  [@rh @rh] -> @rh
   ::
   ::  Returns the power of a floating-point atom to a floating-point exponent.
@@ -2545,6 +2597,7 @@
   --
 ::  quad precision
 ++  rq
+  ~/  %rq
   ^|
   |_  $:  r=$?(%n %u %d %z)   :: round nearest, up, down, to zero
           rtol=_.~~~1e-20     :: relative tolerance for precision of operations
@@ -3121,7 +3174,11 @@
     |=  x=@rq  ^-  @rq
     ?.  (gte (abs x) .~~~1)
       ?:  =(.~~~0 x)  ^~((mul pi .~~~0.5))
-      (atan (div (sqt (abs (sub .~~~1 (mul x x)))) x))
+      ::  atan(sqrt(1-x^2)/x) gives principal value;
+      ::  add pi for negative x to get correct quadrant
+      =/  r  (atan (div (sqt (abs (sub .~~~1 (mul x x)))) x))
+      ?:  (sig x)  r
+      (add r pi)
     ?:  =(.~~~1 x)   .~~~0
     ?:  =(.~~~-1 x)  pi
     ~|([%acos-out-of-bounds x] !!)
@@ -3239,6 +3296,16 @@
   ++  log-2
     |=  z=@rq  ^-  @rq
     (div (log z) log2)
+  ::    +eml:  [@rq @rq] -> @rq
+  ::
+  ::  Returns exp(x) - ln(y) for floating-point atoms.
+  ::    Examples
+  ::      TODO
+  ::  Source
+  ++  eml
+    ~/  %eml
+    |=  [x=@rq y=@rq]  ^-  @rq
+    (sub (exp x) (log y))
   ::    +pow:  [@rq @rq] -> @rq
   ::
   ::  Returns the power of a floating-point atom to a floating-point exponent.

@@ -12,6 +12,7 @@ We support the following functions and special functions:
 - `++neg`, $-$ unary negation
 - `++factorial`, $!$ factorial
 - `++abs`, $\text{abs}$ (pass-through from Lagoon)
+- `++eml`, $\exp(x) - \ln(y)$
 - `++exp`, $\exp$
 - `++sin`, $\sin$
 - `++cos`, $\cos$

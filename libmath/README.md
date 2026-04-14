@@ -14,6 +14,7 @@ We support the following functions and special functions:
 - `++neg`, $-$ unary negation
 - `++factorial`, $!$ factorial
 - `++abs`, $\text{abs}$
+- `++eml`, $\exp(x) - \ln(y)$
 - `++exp`, $\exp$
 - `++sin`, $\sin$
 - `++cos`, $\cos$

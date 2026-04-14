@@ -169,13 +169,64 @@ def make_ray(array, bloq=5):
 
     return Cell(meta, data)
 
-def make_linear_weights(weight, bias, bloq=5):
-    """Convert weight matrix and bias vector to linear-weights noun."""
-    w_ray = make_ray(weight, bloq)
-    b_ray = make_ray(bias.reshape(1, -1), bloq)  # reshape bias to [1 d_out]
-    return Cell(w_ray, b_ray)
+def make_linear_weights(weight, bias, bloq=5, quantize=False):
+    """Convert weight matrix and bias vector to linear-weights noun.
 
-def hf_gpt2_to_noun(model_name='gpt2', bloq=5):
+    If quantize=True, weight is stored as [%q8 int8-ray scale] for 4x size
+    reduction. Bias is always stored at full precision.
+    """
+    if quantize:
+        w_noun = make_q8_weight(weight)
+    else:
+        # [%fp r=ray]
+        w_noun = Cell(kind_atom('%fp'), make_ray(weight, bloq))
+    b_ray = make_ray(bias.reshape(1, -1), bloq)
+    return Cell(w_noun, b_ray)
+
+
+def kind_atom(tag):
+    """Encode a %tas like '%fp' or '%q8' as a Hoon @tas atom (bytes as little-endian int)."""
+    # strip leading '%'
+    if tag.startswith('%'):
+        tag = tag[1:]
+    return int.from_bytes(tag.encode('ascii'), 'little')
+
+
+def make_q8_weight(weight):
+    """Quantize an fp32 weight tensor to int8 + scale.
+
+    Symmetric per-tensor: scale = max(abs(W)) / 127, quantized = round(W/scale).
+    Returns a Hoon noun: [%q8 ray scale=@rs]
+      - ray: uint8 ray (bloq=3, kind=%uint), each byte is two's-complement int8
+      - scale: @rs float
+    """
+    import struct
+    w = weight.astype(np.float32)
+    max_abs = float(np.max(np.abs(w)))
+    if max_abs == 0.0:
+        scale = 1.0
+    else:
+        scale = max_abs / 127.0
+    q = np.round(w / scale).clip(-128, 127).astype(np.int8)
+    # Store as uint8 bytes (two's complement)
+    q_uint8 = q.view(np.uint8)
+
+    shape = list(w.shape)
+    n = q_uint8.size
+    raw_bytes = q_uint8.tobytes()
+    data = (1 << (n * 8)) | int.from_bytes(raw_bytes, 'little')
+
+    # Build ray noun: [meta data]
+    shape_noun = 0
+    for s in reversed(shape):
+        shape_noun = Cell(s, shape_noun)
+    meta = Cell(shape_noun, Cell(3, Cell(kind_atom('%uint'), 0)))
+    ray_noun = Cell(meta, data)
+
+    scale_atom = struct.unpack('<I', struct.pack('<f', scale))[0]
+    return Cell(kind_atom('%q8'), Cell(ray_noun, scale_atom))
+
+def hf_gpt2_to_noun(model_name='gpt2', bloq=5, quantize=False):
     """Load a HuggingFace GPT-2 model and convert to model-weights noun."""
     try:
         from transformers import GPT2LMHeadModel
@@ -192,7 +243,7 @@ def hf_gpt2_to_noun(model_name='gpt2', bloq=5):
     print(f"  d_model={config.n_embd}, n_heads={config.n_head}, "
           f"n_layers={config.n_layer}, vocab={config.vocab_size}")
 
-    # Token embeddings: [vocab_size, d_model]
+    # Token embeddings: [vocab_size, d_model] — kept at fp32
     tok_emb = make_ray(sd['transformer.wte.weight'].numpy(), bloq)
     print("  tok_emb done", flush=True)
 
@@ -211,14 +262,14 @@ def hf_gpt2_to_noun(model_name='gpt2', bloq=5):
         c_attn_b = sd[f'{prefix}.attn.c_attn.bias'].numpy()    # [3*d_model]
 
         d = config.n_embd
-        wq = make_linear_weights(c_attn_w[:, :d], c_attn_b[:d], bloq)
-        wk = make_linear_weights(c_attn_w[:, d:2*d], c_attn_b[d:2*d], bloq)
-        wv = make_linear_weights(c_attn_w[:, 2*d:], c_attn_b[2*d:], bloq)
+        wq = make_linear_weights(c_attn_w[:, :d], c_attn_b[:d], bloq, quantize)
+        wk = make_linear_weights(c_attn_w[:, d:2*d], c_attn_b[d:2*d], bloq, quantize)
+        wv = make_linear_weights(c_attn_w[:, 2*d:], c_attn_b[2*d:], bloq, quantize)
 
         # Output projection
         wo = make_linear_weights(
             sd[f'{prefix}.attn.c_proj.weight'].numpy(),
-            sd[f'{prefix}.attn.c_proj.bias'].numpy(), bloq)
+            sd[f'{prefix}.attn.c_proj.bias'].numpy(), bloq, quantize)
 
         # Layer norms
         ln1_g = make_ray(sd[f'{prefix}.ln_1.weight'].numpy(), bloq)
@@ -229,10 +280,10 @@ def hf_gpt2_to_noun(model_name='gpt2', bloq=5):
         # Feed-forward
         ff1 = make_linear_weights(
             sd[f'{prefix}.mlp.c_fc.weight'].numpy(),
-            sd[f'{prefix}.mlp.c_fc.bias'].numpy(), bloq)
+            sd[f'{prefix}.mlp.c_fc.bias'].numpy(), bloq, quantize)
         ff2 = make_linear_weights(
             sd[f'{prefix}.mlp.c_proj.weight'].numpy(),
-            sd[f'{prefix}.mlp.c_proj.bias'].numpy(), bloq)
+            sd[f'{prefix}.mlp.c_proj.bias'].numpy(), bloq, quantize)
 
         # block-weights = [wq wk wv wo ln1-g ln1-b ln2-g ln2-b ff1 ff2]
         block = Cell(wq, Cell(wk, Cell(wv, Cell(wo,
@@ -262,6 +313,7 @@ def main():
     parser.add_argument('--model', default='gpt2', help='HuggingFace model name')
     parser.add_argument('--output', default='weights.jam', help='Output file')
     parser.add_argument('--bloq', type=int, default=5, help='Precision: 5=float32, 4=float16')
+    parser.add_argument('--quantize', action='store_true', help='Int8-quantize weights (4x smaller)')
     parser.add_argument('--test', action='store_true', help='Create tiny test model instead')
     args = parser.parse_args()
 
@@ -276,7 +328,7 @@ def main():
         def rand_linear(di, do):
             return make_linear_weights(
                 np.random.randn(di, do).astype(np.float32) * 0.02,
-                np.zeros(do, dtype=np.float32), args.bloq)
+                np.zeros(do, dtype=np.float32), args.bloq, args.quantize)
 
         wq = rand_linear(d, d)
         wk = rand_linear(d, d)
@@ -303,7 +355,7 @@ def main():
                                       'n_inner': ff_d, 'vocab_size': vocab,
                                       'n_positions': max_seq})()
     else:
-        weights, config = hf_gpt2_to_noun(args.model, args.bloq)
+        weights, config = hf_gpt2_to_noun(args.model, args.bloq, args.quantize)
 
     print("Jamming noun...")
     jammed = jam(weights)

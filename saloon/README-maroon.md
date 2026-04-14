@@ -96,6 +96,45 @@ operations. Jets exist for lagoon's add, sub, mul, div, mmul, etc.
 The eml primitive (`exp(x) - ln(y)`) has a jet hint and a C implementation
 in `../vere/pkg/noun/jets/e/math_rs.c` — rebuild vere to enable it.
 
+## Chat workflow (tokenize → generate → detokenize)
+
+Chat requires the GPT-2 BPE tokenizer. Since BPE isn't implemented in Hoon
+yet, we use `chat.py` as a Python sidecar that wraps the ship interaction.
+
+1. Install HuggingFace transformers:
+   ```
+   pip install transformers
+   ```
+
+2. Encode a prompt:
+   ```
+   python3 tools/chat.py --prompt "Once upon a time" --n 10
+   ```
+   This prints a dojo command like:
+   ```
+   :maroon &maroon-generate [~[7454 2402 257 640] 10 [%greedy ~]]
+   ```
+
+3. Paste that into your ship's dojo. The agent will generate N tokens
+   (slow without jets — minutes per token on real GPT-2).
+
+4. Retrieve the output token IDs with a scry:
+   ```
+   .^((list @ud) %gx /=maroon=/last-output/noun)
+   ```
+
+5. Decode back to text:
+   ```
+   python3 tools/chat.py --decode '7454 2402 257 640 198 198 198 198'
+   ```
+
+### Sampling strategies
+
+Replace `[%greedy ~]` with one of:
+- `[%greedy ~]` — always pick the highest-logit token (deterministic)
+- `[%temperature .0.8]` — scale logits by 1/t then sample (lower = sharper)
+- `[%top-k 40 .0.9]` — keep top-k, temperature-scale, sample
+
 ## Credits
 
 Based on the EML architecture: Odrzywołek (2026), "All elementary functions

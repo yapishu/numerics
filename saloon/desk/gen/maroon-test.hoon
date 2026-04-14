@@ -15,7 +15,7 @@
 =/  mk-lin
   |=  [[di=@ do=@] b=@]
   ^-  linear-weights:maroon
-  [(mk ~[di do] b) (mk ~[1 do] b)]
+  [[%fp (mk ~[di do] b)] (mk ~[1 do] b)]
 ::
 =/  cfg=model-config:maroon
   [d-model=4 n-heads=1 n-layers=1 d-ff=8 vocab-size=8 max-seq=4 bloq=5]

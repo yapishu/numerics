@@ -16,7 +16,7 @@
   =/  w  (en-ray:la [~[3 2] 5 %i754 ~] ~[.1 .0 .0 .1 .1 .1])
   ::  b = [1 2] bias
   =/  b  (en-ray:la [~[1 2] 5 %i754 ~] ~[.0.1 .0.2])
-  =/  out  (linear:mr:maroon x [w b])
+  =/  out  (linear:mr:maroon x [[%fp w] b])
   ::  check output shape is [2 2]
   %+  expect-eq
     !>(`(list @)`shape.meta.out)
@@ -99,7 +99,7 @@
   =/  mk-lin
     |=  [[di=@ do=@] b=@]
     ^-  linear-weights:maroon
-    [(mk ~[di do] b) (mk ~[1 do] b)]
+    [[%fp (mk ~[di do] b)] (mk ~[1 do] b)]
   =/  wq  (mk-lin [4 4] 5)
   =/  wk  (mk-lin [4 4] 5)
   =/  wv  (mk-lin [4 4] 5)
@@ -118,7 +118,7 @@
   =/  mk-lin
     |=  [[di=@ do=@] b=@]
     ^-  linear-weights:maroon
-    [(mk ~[di do] b) (mk ~[1 do] b)]
+    [[%fp (mk ~[di do] b)] (mk ~[1 do] b)]
   =/  wq  (mk-lin [2 2] 5)
   =/  wk  (mk-lin [2 2] 5)
   =/  wv  (mk-lin [2 2] 5)
@@ -140,7 +140,7 @@
   =/  mk-lin
     |=  [[di=@ do=@] b=@]
     ^-  linear-weights:maroon
-    [(mk ~[di do] b) (mk ~[1 do] b)]
+    [[%fp (mk ~[di do] b)] (mk ~[1 do] b)]
   ::  attention weights: 4->4 projections
   =/  wq  (mk-lin [4 4] 5)
   =/  wk  (mk-lin [4 4] 5)

@@ -17,10 +17,21 @@
 ::
 ::  Weight types for a transformer model.
 ::
+::  A tensor as stored in model-weights:
+::    [%fp r=ray]            — full precision (@rs/@rd etc)
+::    [%q8 r=ray scale=@rs]  — int8 quantized (bloq=3 %uint), dequant = r*scale - offset
+::  For simplicity we use symmetric quantization: no offset, zero stays zero.
+::  Int8 values are stored as @uint bytes (0-255), interpreted as two's complement.
+::
++$  weight-tensor
+  $%  [%fp r=tensor]
+      [%q8 r=tensor scale=@rs]
+  ==
+::
 ::  A single linear projection: W=[d_in d_out], b=[1 d_out]
 +$  linear-weights
-  $:  w=tensor    ::  weight matrix
-      b=tensor    ::  bias vector
+  $:  w=weight-tensor  ::  weight matrix (optionally quantized)
+      b=tensor         ::  bias vector (always fp)
   ==
 ::
 ::  A single transformer block (pre-norm architecture)
@@ -79,9 +90,40 @@
     |=  [x=tensor lw=linear-weights]
     ^-  tensor
     =,  (lake rnd)
-    =/  out  (mmul x w.lw)
+    =/  w-fp  (dequantize w.lw)
+    =/  out  (mmul x w-fp)
     ::  broadcast bias across rows: add b to each row of out
     (add-bias out b.lw)
+  ::
+  ::  +dequantize: return the tensor as @rs-typed tensor,
+  ::  dequantizing from int8 if needed.
+  ::
+  ++  dequantize
+    |=  w=weight-tensor
+    ^-  tensor
+    ?-    -.w
+        %fp  r.w
+        %q8
+      =/  la  (lake rnd)
+      ::  r.w stores bytes in a @uint bloq=3 ray.
+      ::  For each byte: if b < 128 signed = b, else signed = b - 256.
+      ::  Float value = signed * scale.
+      =/  rs-door  ~(. rs:math [rnd .1e-5])
+      =/  bytes  (ravel:la r.w)
+      =/  shape-out  shape.meta.r.w
+      =/  new-meta=meta:ls  [shape-out 5 %i754 ~]
+      =/  f32-vals=(list @)
+        %+  turn  bytes
+        |=  b=@
+        ?:  =(0 b)  .0
+        ?:  (lth b 128)
+          (mul:rs-door (sun:rs-door b) scale.w)
+        ::  b >= 128: signed = b - 256, float = -(256 - b) * scale
+        =/  mag  (sun:rs-door (sub 256 b))
+        (mul:rs-door (mul:rs-door mag .-1) scale.w)
+      =/  data-out  (con data:(zeros:la new-meta) (rep 5 f32-vals))
+      [new-meta data-out]
+    ==
   ::
   ::  +add-bias: add a [1 D] or [D] bias to each row of [S D]
   ::
@@ -261,7 +303,7 @@
       =/  x  (layer-norm-2d x ln-f-g.weights ln-f-b.weights)
       ::  project last position to vocab logits
       =/  last-row  (get-row x ~[(dec seq-len)])
-      (linear last-row [out-proj.weights (zeros [~[1 vocab-size.config] bloq.config %i754 ~])])
+      (linear last-row [[%fp out-proj.weights] (zeros [~[1 vocab-size.config] bloq.config %i754 ~])])
     $(blks t.blks, x (transformer-block x i.blks n-heads.config))
   ::
   ::  +embed: look up token embeddings
@@ -287,6 +329,96 @@
     |=  logits=tensor
     ^-  @ud
     (argmax:la logits)
+  ::
+  ::  +sample-token: sample from a logits distribution.
+  ::  strategy:
+  ::    [%greedy]          — argmax (deterministic)
+  ::    [%temperature t]   — scale by 1/t, then sample from full softmax
+  ::    [%top-k k t]       — keep top-k, apply temperature, sample
+  ::  eny: entropy atom from the bowl (changes each request)
+  ::
+  +$  sampling
+    $%  [%greedy ~]
+        [%temperature t=@rs]
+        [%top-k k=@ud t=@rs]
+    ==
+  ::
+  ++  sample-token
+    |=  [logits=tensor strategy=sampling eny=@]
+    ^-  @ud
+    =/  la  (lake rnd)
+    ?-    -.strategy
+        %greedy  (argmax-token logits)
+        %temperature
+      =/  scaled  (div-scalar:la logits t.strategy)
+      =/  probs  (softmax:sa:saloon scaled)
+      (sample-from-dist probs eny)
+        %top-k
+      =/  scaled  (div-scalar:la logits t.strategy)
+      =/  masked  (mask-top-k scaled k.strategy)
+      =/  probs  (softmax:sa:saloon masked)
+      (sample-from-dist probs eny)
+    ==
+  ::
+  ::  +sample-from-dist: sample an index from a probability distribution.
+  ::  Uses inverse CDF: generate r in [0,1), find first index where cumsum >= r.
+  ::
+  ++  sample-from-dist
+    |=  [probs=tensor eny=@]
+    ^-  @ud
+    =/  la  (lake rnd)
+    =/  els  (ravel:la probs)
+    ::  r = (eny mod 1_000_000) / 1_000_000 as @rs in [0, 1)
+    =/  r  (fnormalize bloq.meta.probs kind.meta.probs (mod eny 1.000.000))
+    =/  i  0
+    =/  cum  (fzero bloq.meta.probs kind.meta.probs)
+    |-  ^-  @ud
+    ?~  els  (dec i)    :: fallback: last index
+    =.  cum  (fadd bloq.meta.probs kind.meta.probs cum i.els)
+    ?:  (fgte bloq.meta.probs kind.meta.probs cum r)
+      i
+    $(i +(i), els t.els, cum cum)
+  ::
+  ::  +mask-top-k: set all but top-k logits to -inf.
+  ::
+  ++  mask-top-k
+    |=  [logits=tensor k=@ud]
+    ^-  tensor
+    =/  la  (lake rnd)
+    ?>  =(1 (lent shape.meta.logits))
+    =/  n  (snag 0 shape.meta.logits)
+    =/  els  (ravel:la logits)
+    ::  sort descending to find the k-th largest value as threshold
+    =/  sorted-els  (sort els (fgth-gate bloq.meta.logits kind.meta.logits))
+    =/  threshold  ?:((lte k n) (snag (dec k) sorted-els) (snag (dec n) sorted-els))
+    =/  neg-inf  (fcon:sa:saloon bloq.meta.logits kind.meta.logits %neg-inf)
+    ::  mask anything below threshold to -inf
+    =/  new-els=(list @)
+      %+  turn  els
+      |=  x=@
+      ?:((fgte bloq.meta.logits kind.meta.logits x threshold) x neg-inf)
+    :-  meta.logits
+    (con data:(zeros:la meta.logits) (rep bloq.meta.logits new-els))
+  ::
+  ::  +generate: generate `n` tokens given a prompt.
+  ::  Returns the full token sequence (prompt + generated).
+  ::
+  ++  generate
+    |=  $:  prompt=(list @ud)
+            n=@ud
+            weights=model-weights
+            config=model-config
+            strategy=sampling
+            eny=@
+        ==
+    ^-  (list @ud)
+    =/  tokens  prompt
+    =/  step  0
+    |-  ^-  (list @ud)
+    ?:  =(step n)  tokens
+    =/  logits  (forward tokens weights config)
+    =/  tok  (sample-token logits strategy (mix eny step))
+    $(step +(step), tokens (snoc tokens tok))
   ::
   ::  Scalar helpers
   ::
@@ -344,6 +476,52 @@
       %6  (~(sqrt rd:math [rnd .~1e-10]) a)
       %5  (~(sqrt rs:math [rnd .1e-5]) a)
       %4  (~(sqrt rh:math [rnd .~~1e-2]) a)
+    ==
+  ++  fzero
+    |=  [=bloq =kind]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+(bloq !! %7 .~~~0, %6 .~0, %5 .0, %4 .~~0)
+  ++  fadd
+    |=  [=bloq =kind a=@ b=@]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+  bloq  !!
+      %7  (~(add rq:math [rnd .~~~0]) a b)
+      %6  (~(add rd:math [rnd .~0]) a b)
+      %5  (~(add rs:math [rnd .0]) a b)
+      %4  (~(add rh:math [rnd .~~0]) a b)
+    ==
+  ++  fgte
+    |=  [=bloq =kind a=@ b=@]
+    ^-  ?
+    ?>  =(%i754 kind)
+    ?+  bloq  !!
+      %7  (~(gte rq:math [rnd .~~~0]) a b)
+      %6  (~(gte rd:math [rnd .~0]) a b)
+      %5  (~(gte rs:math [rnd .0]) a b)
+      %4  (~(gte rh:math [rnd .~~0]) a b)
+    ==
+  ++  fgth-gate
+    |=  [=bloq =kind]
+    ^-  $-([@ @] ?)
+    ?>  =(%i754 kind)
+    ?+  bloq  !!
+      %7  ~(gth rq:math [rnd .~~~0])
+      %6  ~(gth rd:math [rnd .~0])
+      %5  ~(gth rs:math [rnd .0])
+      %4  ~(gth rh:math [rnd .~~0])
+    ==
+  ::  Normalize integer n in [0, 1_000_000) to float in [0, 1).
+  ++  fnormalize
+    |=  [=bloq =kind n=@ud]
+    ^-  @
+    ?>  =(%i754 kind)
+    ?+  bloq  !!
+      %7  (~(div rq:math [rnd .~~~1e-10]) (~(sun rq:math [rnd .~~~1e-10]) n) .~~~1e6)
+      %6  (~(div rd:math [rnd .~1e-10]) (~(sun rd:math [rnd .~1e-10]) n) .~1e6)
+      %5  (~(div rs:math [rnd .1e-5]) (~(sun rs:math [rnd .1e-5]) n) .1e6)
+      %4  (~(div rh:math [rnd .~~0.01]) (~(sun rh:math [rnd .~~0.01]) n) .~~1e3)
     ==
   --
 --

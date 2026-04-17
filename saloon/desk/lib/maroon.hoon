@@ -400,7 +400,7 @@
       =/  last-row  (get-row x ~[last-idx])
       (linear last-row [[%fp out-proj.weights] (zeros [~[1 vocab-size.config] bloq.config %i754 ~])])
     =/  x-out  (transformer-block x i.blks n-heads.config)
-    ~&  >  [%HN-blk blk-idx (dbg-first5 x-out)]
+    ~&  >  ['HN blk' blk-idx (dbg-first5 x-out)]
     $(blks t.blks, x x-out, blk-idx +(blk-idx))
   ::
   ::  +embed: look up token embeddings

@@ -176,11 +176,11 @@
       |-  ^-  tensor
       ?:  =(i seq-len)  scores
       =/  j  +(i)
-      =/  scores
+      =.  scores
         |-  ^-  tensor
         ?:  =(j seq-len)  scores
         $(j +(j), scores (set-item scores ~[i j] neg-inf))
-      $(i +(i))
+      $(i +(i), scores scores)
     ::  apply softmax row-by-row
     =/  i  0
     =/  attn  scores
@@ -296,11 +296,11 @@
     =/  seq-len  (lent tokens)
     ::  token embeddings: look up each token
     =/  x  (embed tokens tok-emb.weights bloq.config)
+    =/  d-model  (snag 1 shape.meta.x)
     ::  add positional embeddings (first seq-len rows).
     ::  NOTE: don't use `submatrix` here — when seq-len=1 the slice becomes
     ::  `[0 0]` which lagoon reads as `[start=0 end=unset]` (whole dim).
     ::  Copy rows explicitly.
-    =/  d-model  (snag 1 shape.meta.x)
     =/  pos=tensor
       =/  init  (zeros [~[seq-len d-model] bloq.config %i754 ~])
       =/  i  0
@@ -309,16 +309,99 @@
       =/  row  (get-row pos-emb.weights ~[i])
       $(i +(i), init (set-row init ~[i] row))
     =/  x  (add x pos)
-    ::  run through transformer blocks
-    =/  blks  blocks.weights
+    =/  last-idx  (dec seq-len)
+    =/  dbg-first5
+      |=  t=tensor  ^-  (list @rs)
+      :~  `@rs`(get-item t ~[last-idx 0])
+          `@rs`(get-item t ~[last-idx 1])
+          `@rs`(get-item t ~[last-idx 2])
+          `@rs`(get-item t ~[last-idx 3])
+          `@rs`(get-item t ~[last-idx 4])
+      ==
+    ~&  >  ['HN embed+pos ' (dbg-first5 x)]
+    ::  Block 0 inlined with per-step debug, so we can pinpoint divergence.
+    =/  blk0  (snag 0 blocks.weights)
+    =/  ln1-out  (layer-norm-2d x ln1-g.blk0 ln1-b.blk0)
+    ~&  >  ['HN blk0 ln1 ' (dbg-first5 ln1-out)]
+    =/  q-full  (linear ln1-out wq.blk0)
+    ~&  >  ['HN blk0 Q ' (dbg-first5 q-full)]
+    =/  k-full  (linear ln1-out wk.blk0)
+    ~&  >  ['HN blk0 K ' (dbg-first5 k-full)]
+    =/  v-full  (linear ln1-out wv.blk0)
+    ~&  >  ['HN blk0 V ' (dbg-first5 v-full)]
+    ::  inline MHA head 0 (cols 0..d-head-1) for debug
+    =/  d-head  (^div d-model n-heads.config)
+    =/  q-h0  (cols q-full 0 (dec d-head))
+    =/  k-h0  (cols k-full 0 (dec d-head))
+    =/  v-h0  (cols v-full 0 (dec d-head))
+    ~&  >  ['HN blk0 q-h0 ' (dbg-first5 q-h0)]
+    ~&  >  ['HN blk0 k-h0 ' (dbg-first5 k-h0)]
+    =/  kt-h0  (transpose2d k-h0)
+    =/  scores0  (mmul q-h0 kt-h0)
+    =/  dk-f  (fsun:sa:saloon bloq.meta.q-h0 kind.meta.q-h0 d-head)
+    =/  sqrt-dk  (fsqrt bloq.meta.q-h0 kind.meta.q-h0 dk-f)
+    =/  scores-scaled  (div-scalar scores0 sqrt-dk)
+    ::  print last row of scaled scores (all 5 positions)
+    =/  dbg-row5
+      |=  t=tensor  ^-  (list @rs)
+      :~  `@rs`(get-item t ~[last-idx 0])
+          `@rs`(get-item t ~[last-idx 1])
+          `@rs`(get-item t ~[last-idx 2])
+          `@rs`(get-item t ~[last-idx 3])
+          `@rs`(get-item t ~[last-idx 4])
+      ==
+    ~&  >  ['HN blk0 scaled-scores last-row ' (dbg-row5 scores-scaled)]
+    ::  apply causal mask
+    =/  neg-inf  (fcon:sa:saloon bloq.meta.q-h0 kind.meta.q-h0 %neg-inf)
+    =/  sc-masked
+      =/  ii  0
+      =/  sc  scores-scaled
+      |-  ^-  tensor
+      ?:  =(ii seq-len)  sc
+      =/  jj  +(ii)
+      =.  sc
+        |-  ^-  tensor
+        ?:  =(jj seq-len)  sc
+        $(jj +(jj), sc (set-item sc ~[ii jj] neg-inf))
+      $(ii +(ii), sc sc)
+    ~&  >  ['HN blk0 masked-scores last-row ' (dbg-row5 sc-masked)]
+    ::  full softmax (row-by-row)
+    =/  sm
+      =/  ii  0
+      =/  a  sc-masked
+      |-  ^-  tensor
+      ?:  =(ii seq-len)  a
+      =/  row  (get-row sc-masked ~[ii])
+      =/  smr  (softmax:sa:saloon row)
+      $(ii +(ii), a (set-row a ~[ii] smr))
+    ~&  >  ['HN blk0 softmax last-row ' (dbg-row5 sm)]
+    =/  head0-out  (mmul sm v-h0)
+    ~&  >  ['HN blk0 head0 ' (dbg-first5 head0-out)]
+    =/  attn-out
+      (multi-head-attention ln1-out n-heads.config wq.blk0 wk.blk0 wv.blk0 wo.blk0)
+    ~&  >  ['HN blk0 attn ' (dbg-first5 attn-out)]
+    =/  x  (add x attn-out)
+    ~&  >  ['HN blk0 after-res1 ' (dbg-first5 x)]
+    =/  ln2-out  (layer-norm-2d x ln2-g.blk0 ln2-b.blk0)
+    ~&  >  ['HN blk0 ln2 ' (dbg-first5 ln2-out)]
+    =/  ff-out  (feed-forward ln2-out ff1.blk0 ff2.blk0)
+    ~&  >  ['HN blk0 ff ' (dbg-first5 ff-out)]
+    =/  x  (add x ff-out)
+    ~&  >  ['HN blk0 out ' (dbg-first5 x)]
+    ::  run remaining blocks (1..N-1)
+    =/  blks  (slag 1 blocks.weights)
+    =/  blk-idx  1
     |-  ^-  tensor
     ?~  blks
       ::  final layer norm
       =/  x  (layer-norm-2d x ln-f-g.weights ln-f-b.weights)
+      ~&  >  ['HN after final-LN ' (dbg-first5 x)]
       ::  project last position to vocab logits
-      =/  last-row  (get-row x ~[(dec seq-len)])
+      =/  last-row  (get-row x ~[last-idx])
       (linear last-row [[%fp out-proj.weights] (zeros [~[1 vocab-size.config] bloq.config %i754 ~])])
-    $(blks t.blks, x (transformer-block x i.blks n-heads.config))
+    =/  x-out  (transformer-block x i.blks n-heads.config)
+    ~&  >  [%HN-blk blk-idx (dbg-first5 x-out)]
+    $(blks t.blks, x x-out, blk-idx +(blk-idx))
   ::
   ::  +embed: look up token embeddings
   ::
@@ -546,18 +629,18 @@
     |-  ^-  tensor
     ?:  =(i rows)  out
     ::  copy a's row i, columns 0..cols-a-1
-    =/  out
+    =.  out
       =/  j  0
       |-  ^-  tensor
       ?:  =(j cols-a)  out
       $(j +(j), out (set-item:la out ~[i j] (get-item:la a ~[i j])))
     ::  copy b's row i, columns cols-a..out-cols-1
-    =/  out
+    =.  out
       =/  j  0
       |-  ^-  tensor
       ?:  =(j cols-b)  out
       $(j +(j), out (set-item:la out ~[i (^add cols-a j)] (get-item:la b ~[i j])))
-    $(i +(i))
+    $(i +(i), out out)
   ::
   ::  +cols: extract columns [c-start..c-end] inclusive from a 2D tensor.
   ::  Lagoon's submatrix has a Hoon gotcha where [0 0] is misparsed as
@@ -575,12 +658,12 @@
     |-  ^-  tensor
     ?:  =(i rows)  out
     =/  j  0
-    =/  out
+    =.  out
       |-  ^-  tensor
       ?:  =(j new-cols)  out
       =/  v  (get-item:la a ~[i (add c-start j)])
       $(j +(j), out (set-item:la out ~[i j] v))
-    $(i +(i))
+    $(i +(i), out out)
   ::
   ::  +transpose2d: working 2D transpose (workaround for lagoon bug)
   ::
@@ -598,11 +681,11 @@
     |-  ^-  tensor
     ?:  =(i rows)  out
     =/  j  0
-    =/  out
+    =.  out
       |-  ^-  tensor
       ?:  =(j cols)  out
       $(j +(j), out (set-item:la out ~[j i] (get-item:la a ~[i j])))
-    $(i +(i))
+    $(i +(i), out out)
   ::
   ++  fsqrt
     |=  [=bloq =kind a=@]

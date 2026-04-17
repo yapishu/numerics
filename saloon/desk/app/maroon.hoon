@@ -480,6 +480,7 @@
       =/  logits
         %+  linear:mr:maroon  last-row
         [[%fp out-proj.w] bias-zeros]
+      =/  flat  (ravel:la logits)
       =/  next-tok
         %:  sample-token:mr:maroon
           logits  strategy.g  tokens.g

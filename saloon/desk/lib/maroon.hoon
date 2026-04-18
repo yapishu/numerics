@@ -398,7 +398,15 @@
       ~&  >  ['HN after final-LN ' (dbg-first5 x)]
       ::  project last position to vocab logits
       =/  last-row  (get-row x ~[last-idx])
-      (linear last-row [[%fp out-proj.weights] (zeros [~[1 vocab-size.config] bloq.config %i754 ~])])
+      =/  logits
+        (linear last-row [[%fp out-proj.weights] (zeros [~[1 vocab-size.config] bloq.config %i754 ~])])
+      ~&  >  ['HN logit[262] ' `@rs`(get-item logits ~[0 262])]
+      ~&  >  ['HN logit[257] ' `@rs`(get-item logits ~[0 257])]
+      ~&  >  ['HN logit[49.994] ' `@rs`(get-item logits ~[0 49.994])]
+      ~&  >  ['HN logit[0] ' `@rs`(get-item logits ~[0 0])]
+      ~&  >  ['HN logit[1] ' `@rs`(get-item logits ~[0 1])]
+      ~&  >  ['HN logit[last] ' `@rs`(get-item logits ~[0 (dec vocab-size.config)])]
+      logits
     =/  x-out  (transformer-block x i.blks n-heads.config)
     ~&  >  ['HN blk' blk-idx (dbg-first5 x-out)]
     $(blks t.blks, x x-out, blk-idx +(blk-idx))

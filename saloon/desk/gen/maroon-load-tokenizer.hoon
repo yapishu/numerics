@@ -1,7 +1,7 @@
 ::  Load GPT-2 BPE tokenizer from /weights/gpt2-tokenizer.jam
 ::
 ::  Generate with:
-::    python3 tools/tokenizer_to_noun.py --output gpt2-tokenizer.jam
+::    gguf2jam --arch tokenizer <hf-tokenizer.json> -o gpt2-tokenizer.jam
 ::  Put into your pier at saloon/weights/gpt2-tokenizer.jam then |commit.
 ::
 /-  ls=lagoon
@@ -15,7 +15,7 @@
 =/  jam-res  (mule |.(.^(@ %cx path)))
 ?:  ?=(%| -.jam-res)
   ~&  >>>  'tokenizer not found at /weights/gpt2-tokenizer.jam'
-  ~&  >>>  'generate with: python3 tools/tokenizer_to_noun.py --output gpt2-tokenizer.jam'
+  ~&  >>>  'generate with: gguf2jam --arch tokenizer <hf-tokenizer.json> -o gpt2-tokenizer.jam'
   ~|  %no-tokenizer-file
   !!
 ~&  >  "loaded gpt2-tokenizer.jam ({<(met 3 p.jam-res)>} bytes)"

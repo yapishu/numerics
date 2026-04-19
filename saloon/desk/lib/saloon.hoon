@@ -412,6 +412,44 @@
     ::  gamma * (x - mean) / std + beta
     (add (mul gamma (div diff std)) beta)
   ::
+  ::    +rms-norm: [$ray $ray @rs] -> $ray
+  ::
+  ::  RMS normalization: gamma * x / sqrt(mean(x²) + eps)
+  ::  No mean subtraction, no beta. Used by Llama/Qwen-family models.
+  ::  Source
+  ++  rms-norm
+    ~/  %rms-norm
+    |=  [x=ray:ls gamma=ray:ls eps=@rs]
+    ^-  ray
+    =/  n-elements  (roll shape.meta.x ^mul)
+    =,  (lake rnd)
+    =/  zero-idx  (reap (lent shape.meta.x) 0)
+    =/  n-val  (fsun bloq.meta.x kind.meta.x n-elements)
+    ::  ms = sum(x²) / n
+    =/  ms-val
+      =/  sq-sum  (get-item:la (cumsum:la (mul x x)) zero-idx)
+      (fdiv bloq.meta.x kind.meta.x sq-sum n-val)
+    =/  rms  (sqrt (add-scalar:la (fill:la meta.x ms-val) eps))
+    ::  gamma * (x / rms)
+    (mul gamma (div x rms))
+  ::
+  ::    +silu: $ray -> $ray
+  ::
+  ::  SiLU (swish) activation: x * sigmoid(x) = x / (1 + exp(-x)).
+  ::  Used by Llama/Qwen SwiGLU MLPs.
+  ::  Source
+  ++  silu
+    ~/  %silu
+    |=  x=ray:ls
+    ^-  ray
+    =,  (lake rnd)
+    ::  sigmoid(x) = 1 / (1 + exp(-x))
+    =/  one       (fcon bloq.meta.x kind.meta.x %one)
+    =/  neg-x     (mul-scalar:la x (fcon bloq.meta.x kind.meta.x %neg-one))
+    =/  exp-nx    (exp neg-x)
+    =/  denom     (add-scalar:la exp-nx one)
+    (mul x (div (fill:la meta.x one) denom))
+  ::
   ::  Precision-aware float constants and scalar ops
   ::
   ++  fcon
@@ -429,6 +467,10 @@
       ?+(bloq !! %7 .~~~1e-5, %6 .~1e-5, %5 .1e-5, %4 .~~0.001)
         %neg-inf
       ?+(bloq !! %7 `@rq`0xffff.0000.0000.0000.0000.0000.0000.0000, %6 `@rd`0xfff0.0000.0000.0000, %5 `@rs`0xff80.0000, %4 `@rh`0xfc00)
+        %one
+      ?+(bloq !! %7 .~~~1, %6 .~1, %5 .1, %4 .~~1)
+        %neg-one
+      ?+(bloq !! %7 .~~~-1, %6 .~-1, %5 .-1, %4 .~~-1)
     ==
   ++  fsun
     |=  [=bloq =kind n=@ud]

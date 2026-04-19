@@ -27,6 +27,13 @@
 +$  weight-tensor
   $%  [%fp r=tensor]
       [%q8 r=tensor scale=@rs]
+      ::  MLX 2-bit packed:
+      ::    wq      = [out, in/16]    bloq=5 kind=%uint, 16 int2s per uint32
+      ::    scales  = [out, in/gsz]   fp32 (per-group)
+      ::    biases  = [out, in/gsz]   fp32 (per-group)
+      ::  Dequant (fused with transpose) produces [in, out] fp32 — ready for
+      ::  direct mmul as `x @ W` without a separate transpose step.
+      [%mlx2 wq=tensor scales=tensor biases=tensor group-size=@ud]
   ==
 ::
 ::  A single linear projection: W=[d_in d_out], b=[1 d_out]
@@ -50,7 +57,7 @@
       ff2=linear-weights          ::  contract
   ==
 ::
-::  Full model weights
+::  Full model weights (GPT-2 / vanilla pre-norm transformer)
 +$  model-weights
   $:  tok-emb=tensor              ::  [vocab_size d_model]
       pos-emb=tensor              ::  [max_seq d_model]
@@ -58,6 +65,46 @@
       ln-f-g=tensor               ::  final layer norm gamma
       ln-f-b=tensor               ::  final layer norm beta
       out-proj=tensor             ::  [d_model vocab_size]
+  ==
+::
+::  Qwen3 block: GQA attention + per-head q/k RMSNorm + SwiGLU MLP + 2 RMSNorms.
+::  No biases in linear projections.
++$  block-weights-qwen3
+  $:  q-proj=weight-tensor         ::  [d_model d_model]
+      k-proj=weight-tensor         ::  [d_model n_kv_heads*head_dim]
+      v-proj=weight-tensor         ::  [d_model n_kv_heads*head_dim]
+      o-proj=weight-tensor         ::  [d_model d_model]
+      gate-proj=weight-tensor      ::  [d_model d_ff]
+      up-proj=weight-tensor        ::  [d_model d_ff]
+      down-proj=weight-tensor      ::  [d_ff d_model]
+      input-ln=tensor              ::  [d_model] pre-attn RMSNorm gamma
+      post-attn-ln=tensor          ::  [d_model] pre-MLP RMSNorm gamma
+      q-norm=tensor                ::  [head_dim] per-head Q RMSNorm gamma
+      k-norm=tensor                ::  [head_dim] per-head K RMSNorm gamma
+  ==
+::
+::  Qwen3 model: tied embeddings (no separate out-proj, no pos-emb — uses RoPE)
++$  model-weights-qwen3
+  $:  tok-emb=weight-tensor        ::  mlx2 [vocab d_model]
+      blocks=(list block-weights-qwen3)
+      ln-f=tensor                  ::  final RMSNorm gamma [d_model]
+  ==
+::
+::  Qwen3 config
++$  model-config-qwen3
+  $:  d-model=@ud
+      n-heads=@ud
+      n-kv-heads=@ud               ::  GQA: groups of n-heads/n-kv-heads
+      n-layers=@ud
+      d-ff=@ud
+      vocab-size=@ud
+      max-seq=@ud
+      head-dim=@ud
+      rms-eps=@rs                  ::  RMSNorm epsilon (typically 1e-6)
+      rope-theta=@rs               ::  RoPE base frequency (typically 1e6 for Qwen3)
+      yarn-factor=@rs              ::  YaRN interpolation factor
+      yarn-orig-max-seq=@ud        ::  original training context length
+      bloq=@ud
   ==
 ::
 ::  Model config
@@ -101,6 +148,127 @@
   =/  data-out  (con data:(zeros:la new-meta) (rep 5 f32-vals))
   [new-meta data-out]
 ::
+::  +dequant-mlx2-ray: MLX 2-bit packed weight -> fp32 ray.
+::    w shape       = [out, in/16]    bloq=5 kind=%uint   (16 int2s per uint32)
+::    scales shape  = [out, in/G]     bloq=5 kind=%i754   (one fp32 per group of G)
+::    biases shape  = [out, in/G]     same as scales
+::    out shape     = [out, in]       bloq=5 kind=%i754
+::  Per-element: fp = scales[o, i/G] * (q & 0x3) + biases[o, i/G]
+::                where q = (w[o, i/16] >> ((i % 16) * 2))
+::  Pure Hoon reference; will need a jet for production use.
+::
+::  +dequant-mlx2-row: dequant a single row of an mlx2-packed weight to fp32.
+::  Lets the embedding lookup avoid materializing the full [vocab, d_model]
+::  fp32 table (1.2 GB on Qwen3 1.7B) just to read a handful of rows.
+::    w shape:       [out, in/16] uint32
+::    scales/biases: [out, in/G]  fp32
+::    out:           [in]         fp32 (1-D)
+::
+++  dequant-mlx2-row
+  ~/  %dequant-mlx2-row
+  |=  [w=tensor scales=tensor biases=tensor group-size=@ud row=@ud]
+  ^-  tensor
+  =/  la  (lake %n)
+  =/  rs-door  ~(. rs:math [%n .1e-5])
+  =/  packed-cols     (snag 1 shape.meta.w)
+  =/  in-features     (mul 16 packed-cols)
+  =/  groups-per-row  (div in-features group-size)
+  =/  w-data  data.w
+  =/  s-data  data.scales
+  =/  b-data  data.biases
+  =/  out-vals=(list @)  ~
+  =/  wc  0
+  |-  ^-  tensor
+  ?:  =(wc packed-cols)
+    =/  out-meta=meta:ls  [~[in-features] 5 %i754 ~]
+    =/  data-out  (con data:(zeros:la out-meta) (rep 5 (flop out-vals)))
+    [out-meta data-out]
+  =/  word    (cut 5 [(add (mul row packed-cols) wc) 1] w-data)
+  =/  i-base  (mul wc 16)
+  =/  out-vals-after-word
+    =/  k  0
+    =/  acc  out-vals
+    |-  ^-  (list @)
+    ?:  =(k 16)  acc
+    =/  i      (add i-base k)
+    =/  grp    (div i group-size)
+    =/  scale  `@rs`(cut 5 [(add (mul row groups-per-row) grp) 1] s-data)
+    =/  bias   `@rs`(cut 5 [(add (mul row groups-per-row) grp) 1] b-data)
+    =/  q      (cut 0 [(mul k 2) 2] word)
+    =/  qf     (sun:rs-door q)
+    =/  val    `@`(add:rs-door (mul:rs-door scale qf) bias)
+    $(k +(k), acc [val acc])
+  $(wc +(wc), out-vals out-vals-after-word)
+::
+++  dequant-mlx2-ray
+  ~/  %dequant-mlx2
+  |=  [w=tensor scales=tensor biases=tensor group-size=@ud]
+  ^-  tensor
+  =/  la  (lake %n)
+  =/  rs-door  ~(. rs:math [%n .1e-5])
+  ?>  =(2 (lent shape.meta.w))
+  =/  out-features    (snag 0 shape.meta.w)
+  =/  packed-cols     (snag 1 shape.meta.w)
+  =/  in-features     (mul 16 packed-cols)
+  =/  groups-per-row  (div in-features group-size)
+  =/  w-data  data.w
+  =/  s-data  data.scales
+  =/  b-data  data.biases
+  ::  Output shape is [in_features, out_features] (fused with transpose).
+  ::  Walk i outer, o inner — row-major emission matches the output layout.
+  ::  For each (i, o) pair, look up: word = w[o, i/16], scale/bias[o, i/G].
+  =/  out-meta=meta:ls  [~[in-features out-features] 5 %i754 ~]
+  =/  out-vals=(list @)  ~
+  =/  i  0
+  |-  ^-  tensor
+  ?:  =(i in-features)
+    =/  data-out  (con data:(zeros:la out-meta) (rep 5 (flop out-vals)))
+    [out-meta data-out]
+  =/  word-col  (div i 16)
+  =/  bit-off   (mul (mod i 16) 2)
+  =/  grp       (div i group-size)
+  =/  out-vals-after-i
+    =/  o  0
+    =/  acc  out-vals
+    |-  ^-  (list @)
+    ?:  =(o out-features)  acc
+    =/  word   (cut 5 [(add (mul o packed-cols) word-col) 1] w-data)
+    =/  q      (cut 0 [bit-off 2] word)
+    =/  scale  `@rs`(cut 5 [(add (mul o groups-per-row) grp) 1] s-data)
+    =/  bias   `@rs`(cut 5 [(add (mul o groups-per-row) grp) 1] b-data)
+    =/  qf     (sun:rs-door q)
+    =/  val    `@`(add:rs-door (mul:rs-door scale qf) bias)
+    $(o +(o), acc [val acc])
+  $(i +(i), out-vals out-vals-after-i)
+::
+::  +logits-tied-mlx2-fused: compute [1, vocab] = x @ dequant(wte).T where wte
+::  is mlx2-packed. Jetted as %logits-tied-mlx2; Hoon fallback is too slow for
+::  real vocabs (151k × per-row dequant in pure Hoon). At top level so the
+::  C jet can dispatch against it without navigating through the `mr` core.
+::
+++  logits-tied-mlx2-fused
+  ~/  %logits-tied-mlx2
+  |=  [x=tensor w=tensor scales=tensor biases=tensor group-size=@ud]
+  ^-  tensor
+  =/  la  (lake %n)
+  =/  rs-door  ~(. rs:math [%n .1e-5])
+  ?>  =(2 (lent shape.meta.w))
+  =/  vocab        (snag 0 shape.meta.w)
+  =/  packed-cols  (snag 1 shape.meta.w)
+  =/  d-model      (mul 16 packed-cols)
+  =/  out-meta=meta:ls  [~[1 vocab] 5 %i754 ~]
+  =/  vals=(list @)  ~
+  =/  v  0
+  |-  ^-  tensor
+  ?:  =(v vocab)
+    =/  data-out  (con data:(zeros:la out-meta) (rep 5 (flop vals)))
+    [out-meta data-out]
+  =/  wte-v  (dequant-mlx2-row w scales biases group-size v)
+  =/  wte-2d  (reshape:la wte-v ~[d-model 1])
+  =/  dot  (mmul:la x wte-2d)
+  =/  val  `@`(get-item:la dot ~[0 0])
+  $(v +(v), vals [val vals])
+::
 ++  mr
   =+  [rnd=*rounding-mode]
   |%
@@ -125,8 +293,9 @@
     |=  w=weight-tensor
     ^-  tensor
     ?-  -.w
-      %fp  r.w
-      %q8  (dequant-q8-ray r.w scale.w)
+      %fp    r.w
+      %q8    (dequant-q8-ray r.w scale.w)
+      %mlx2  (dequant-mlx2-ray wq.w scales.w biases.w group-size.w)
     ==
   ::
   ::  +add-bias: add a [1 D] or [D] bias to each row of [S D]
@@ -427,6 +596,596 @@
     ?~  tokens  out
     =/  row  (get-row emb-table ~[i.tokens])
     $(tokens t.tokens, i +(i), out (set-row out ~[i] row))
+  ::
+  ::  =======================================================================
+  ::  Qwen3-family primitives (RMSNorm, SwiGLU, RoPE+YaRN, GQA).
+  ::  Generic transformer pieces used by any Llama/Qwen-style model.
+  ::  =======================================================================
+  ::
+  ::  +rms-norm-2d: apply RMSNorm row-by-row on a [S D] tensor.
+  ::  gamma is [D]; x is [S D]. No bias.
+  ::
+  ++  rms-norm-2d
+    |=  [x=tensor gamma=tensor eps=@rs]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  n-rows  (snag 0 shape.meta.x)
+    =/  d       (snag 1 shape.meta.x)
+    =/  i       0
+    =/  out     x
+    |-  ^-  tensor
+    ?:  =(i n-rows)  out
+    =/  row     (get-row x ~[i])
+    =/  r1d     (reshape row ~[d])
+    =/  normed  (rms-norm:sa:saloon r1d gamma eps)
+    =/  n2d     (reshape normed ~[1 d])
+    $(i +(i), out (set-row out ~[i] n2d))
+  ::
+  ::  +silu-mul: element-wise silu(a) * b. Used in SwiGLU MLP.
+  ::
+  ++  silu-mul
+    |=  [a=tensor b=tensor]
+    ^-  tensor
+    =,  (lake rnd)
+    (mul (silu:sa:saloon a) b)
+  ::
+  ::  +swiglu-mlp: Qwen/Llama gated MLP. No biases.
+  ::    hidden = silu(gate-proj(x)) * up-proj(x)
+  ::    out    = down-proj(hidden)
+  ::
+  ++  swiglu-mlp
+    |=  $:  x=tensor
+            gate-w=weight-tensor
+            up-w=weight-tensor
+            down-w=weight-tensor
+        ==
+    ^-  tensor
+    =,  (lake rnd)
+    =/  gate   (linear-nobias x gate-w)
+    =/  up     (linear-nobias x up-w)
+    =/  hidden  (silu-mul gate up)
+    (linear-nobias hidden down-w)
+  ::
+  ::  +linear-nobias: x @ W.T for a weight-tensor with no bias.
+  ::  MLX (and HuggingFace) stores linear weights as [out, in]; our mmul
+  ::  expects [in, out], so transpose after dequant. No-op in the equivalent
+  ::  fp path if caller already stored in [in, out].
+  ::
+  ++  linear-nobias
+    |=  [x=tensor w=weight-tensor]
+    ^-  tensor
+    =,  (lake rnd)
+    ::  mlx2 dequant emits [in, out] directly (fused transpose), so we can
+    ::  mmul straight through without a separate transpose pass.
+    (mmul x (dequantize w))
+  ::
+  ::  +fast-transpose: in-place shape-wise 2D transpose of a fp32 ray.
+  ::  Both lagoon's jetted transpose (has _check oddities) and maroon's
+  ::  transpose2d (pure-Hoon per-element set-item) OOM on 2k-dim weights.
+  ::  This builds a fresh output atom via cut on input data + list/rep on
+  ::  the way out, so one allocation at the end, no tree walks.
+  ::
+  ++  fast-transpose
+    |=  a=tensor
+    ^-  tensor
+    =,  (lake rnd)
+    ?>  =(2 (lent shape.meta.a))
+    =/  rows  (snag 0 shape.meta.a)
+    =/  cols  (snag 1 shape.meta.a)
+    =/  a-data  data.a
+    =/  out-meta=meta:ls  [~[cols rows] bloq.meta.a kind.meta.a ~]
+    ::  Emit in column-major order so transposed element (i, j) comes from
+    ::  a[j, i] = a-data at linear index j*cols + i. Traverse j outer, i inner
+    ::  to build row-major output where row = old column.
+    =/  vals=(list @)  ~
+    =/  i  0
+    |-  ^-  tensor
+    ?:  =(i cols)
+      =/  data-out  (con data:(zeros out-meta) (rep bloq.meta.a (flop vals)))
+      [out-meta data-out]
+    =/  vals-after-i
+      =/  j  0
+      =/  acc  vals
+      |-  ^-  (list @)
+      ?:  =(j rows)  acc
+      =/  v  (cut bloq.meta.a [(^add (^mul j cols) i) 1] a-data)
+      $(j +(j), acc [v acc])
+    $(i +(i), vals vals-after-i)
+  ::
+  ::  +rope-inv-freq: compute [head_dim/2] inverse frequencies with YaRN scaling.
+  ::    inv_freq[j] = 1 / base^(2j/head-dim)
+  ::    YaRN piecewise modifies:
+  ::      wavelen = 2pi / inv_freq
+  ::      wavelen < high_freq_wavelen:  keep
+  ::      wavelen > low_freq_wavelen:   divide by factor
+  ::      else:                         smooth interpolate
+  ::  low_freq_factor=1, high_freq_factor=32 are HF defaults for Qwen3.
+  ::
+  ++  rope-inv-freq
+    |=  $:  head-dim=@ud
+            base=@rs
+            orig-max=@ud
+            factor=@rs       ::  yarn factor (1 = plain RoPE)
+        ==
+    ^-  tensor
+    =,  (lake rnd)
+    =/  rs  ~(. rs:math [%n .1e-5])
+    =/  half       (^div head-dim 2)
+    =/  meta       `meta:ls`[~[half] 5 %i754 ~]
+    =/  out        (zeros meta)
+    =/  low-fac    .1
+    =/  high-fac   .32
+    =/  pi2        (mul:rs .2 .3.14159265)
+    =/  low-wav    (div:rs (sun:rs orig-max) low-fac)   ::  8192
+    =/  high-wav   (div:rs (sun:rs orig-max) high-fac)  ::  256
+    =/  hd-rs      (sun:rs head-dim)
+    =/  j          0
+    |-  ^-  tensor
+    ?:  =(j half)  out
+    ::  exponent = 2j/head_dim
+    =/  two-j      (sun:rs (^mul 2 j))
+    =/  expnt      (div:rs two-j hd-rs)
+    ::  base_pow = base ** expnt = exp(expnt * ln(base))
+    =/  ln-base    (log:rs base)
+    =/  base-pow   (exp:rs (mul:rs expnt ln-base))
+    =/  inv        (div:rs .1 base-pow)
+    =/  wavelen    (div:rs pi2 inv)
+    ::  YaRN piecewise (factor=1 short-circuits to plain RoPE)
+    =/  scaled
+      ?:  =(factor .1)  inv
+      ?:  (lth:rs wavelen high-wav)  inv
+      ?:  (gth:rs wavelen low-wav)   (div:rs inv factor)
+      ::  smooth ramp
+      =/  s  (div:rs (sub:rs (div:rs (sun:rs orig-max) wavelen) low-fac) (sub:rs high-fac low-fac))
+      =/  one-minus-s  (sub:rs .1 s)
+      (add:rs (mul:rs one-minus-s (div:rs inv factor)) (mul:rs s inv))
+    $(j +(j), out (set-item out ~[j] scaled))
+  ::
+  ::  +rope-attention-factor: YaRN attention scaling applied uniformly to cos/sin.
+  ::    attention_factor = 0.1 * ln(factor) + 1.0 for factor > 1; else 1.0
+  ::
+  ++  rope-attention-factor
+    |=  factor=@rs  ^-  @rs
+    =/  rs  ~(. rs:math [%n .1e-5])
+    ?:  =(factor .1)  .1
+    (add:rs (mul:rs .0.1 (log:rs factor)) .1)
+  ::
+  ::  +rope-cos-sin: build [seq-len, head-dim] cos and sin tables.
+  ::    For each position p, each dim j in [0, head_dim):
+  ::      j < head_dim/2:  angle = inv_freq[j] * p
+  ::      j >= head_dim/2: angle = inv_freq[j - head_dim/2] * p  (mirrored)
+  ::    cos[p, j] = cos(angle) * attn_factor
+  ::    sin[p, j] = sin(angle) * attn_factor
+  ::
+  ++  rope-cos-sin
+    |=  [seq-len=@ud head-dim=@ud inv-freq=tensor attn-factor=@rs]
+    ^-  [cos=tensor sin=tensor]
+    =,  (lake rnd)
+    =/  rs  ~(. rs:math [%n .1e-5])
+    =/  meta=meta:ls  [~[seq-len head-dim] 5 %i754 ~]
+    =/  half  (^div head-dim 2)
+    =/  cos-out  (zeros meta)
+    =/  sin-out  (zeros meta)
+    =/  p  0
+    |-  ^-  [tensor tensor]
+    ?:  =(p seq-len)  [cos-out sin-out]
+    ::  Inner j-loop returns [cos-out sin-out] as a pair so both mutations
+    ::  propagate back out (a single `=.` would only yield one variable).
+    =/  pq=[tensor tensor]
+      =/  j  0
+      |-  ^-  [tensor tensor]
+      ?:  =(j head-dim)  [cos-out sin-out]
+      =/  j-mod  ?:((^lth j half) j (^sub j half))
+      =/  inv    `@rs`(get-item inv-freq ~[j-mod])
+      =/  angle  (mul:rs (sun:rs p) inv)
+      =/  c      (mul:rs (cos:rs angle) attn-factor)
+      =/  s      (mul:rs (sin:rs angle) attn-factor)
+      %=  $
+        j        +(j)
+        cos-out  (set-item cos-out ~[p j] c)
+        sin-out  (set-item sin-out ~[p j] s)
+      ==
+    $(p +(p), cos-out -.pq, sin-out +.pq)
+  ::
+  ::  +rope-apply: rotate a [S, H, D_head] tensor in half-rotated convention.
+  ::    cos, sin are [S, D_head] tables from +rope-cos-sin.
+  ::    out[p, h, j]            = x[p, h, j] * cos[p, j] + rotate_half(x)[p, h, j] * sin[p, j]
+  ::    where rotate_half(x)[p, h, j] =
+  ::      j <  D_head/2:  -x[p, h, j + D_head/2]
+  ::      j >= D_head/2:   x[p, h, j - D_head/2]
+  ::
+  ++  rope-apply
+    |=  [x=tensor cos=tensor sin=tensor]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  rs  ~(. rs:math [%n .1e-5])
+    =/  seq-len  (snag 0 shape.meta.x)
+    =/  n-heads  (snag 1 shape.meta.x)
+    =/  d-head   (snag 2 shape.meta.x)
+    =/  half     (^div d-head 2)
+    ::  Walk (p, h, j) in output row-major (j innermost), computing each value;
+    ::  rep them into one atom at the end. Avoids per-element set-item on a
+    ::  4M-word ray (catastrophic allocation).
+    =/  out-meta=meta:ls  [~[seq-len n-heads d-head] 5 %i754 ~]
+    =/  vals=(list @)  ~
+    =/  p  0
+    |-  ^-  tensor
+    ?:  =(p seq-len)
+      =/  data-out  (con data:(zeros out-meta) (rep 5 (flop vals)))
+      [out-meta data-out]
+    =/  vals-after-p
+      =/  h  0
+      =/  acc  vals
+      |-  ^-  (list @)
+      ?:  =(h n-heads)  acc
+      =/  acc-after-h
+        =/  j  0
+        =/  acc2  acc
+        |-  ^-  (list @)
+        ?:  =(j d-head)  acc2
+        =/  xj     `@rs`(get-item x ~[p h j])
+        =/  cp     `@rs`(get-item cos ~[p j])
+        =/  sp     `@rs`(get-item sin ~[p j])
+        =/  rj-idx  ?:((^lth j half) (^add j half) (^sub j half))
+        =/  xr     `@rs`(get-item x ~[p h rj-idx])
+        =/  rot    ?:((^lth j half) (mul:rs xr .-1) xr)
+        =/  o      `@`(add:rs (mul:rs xj cp) (mul:rs rot sp))
+        $(j +(j), acc2 [o acc2])
+      $(h +(h), acc acc-after-h)
+    $(p +(p), vals vals-after-p)
+  ::
+  ::  +per-head-rms-norm: apply RMSNorm to each head's [D_head] vector.
+  ::    x:     [S, H, D_head]
+  ::    gamma: [D_head]
+  ::    out:   same shape; each head's feature vec normalized independently.
+  ::
+  ++  per-head-rms-norm
+    |=  [x=tensor gamma=tensor eps=@rs]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  rs  ~(. rs:math [%n .1e-5])
+    =/  seq-len  (snag 0 shape.meta.x)
+    =/  n-heads  (snag 1 shape.meta.x)
+    =/  d-head   (snag 2 shape.meta.x)
+    =/  x-data   data.x
+    =/  g-data   data.gamma
+    =/  d-rs     (sun:rs d-head)
+    =/  out-meta=meta:ls  [~[seq-len n-heads d-head] 5 %i754 ~]
+    ::  Walk (p, h) pairs. For each, compute rms scalar, then emit D_head vals.
+    =/  vals=(list @)  ~
+    =/  p  0
+    |-  ^-  tensor
+    ?:  =(p seq-len)
+      =/  data-out  (con data:(zeros out-meta) (rep 5 (flop vals)))
+      [out-meta data-out]
+    =/  vals-after-p
+      =/  h  0
+      =/  acc  vals
+      |-  ^-  (list @)
+      ?:  =(h n-heads)  acc
+      =/  base  (^mul (^add (^mul p n-heads) h) d-head)
+      ::  Compute sum of squares for this head.
+      =/  ss
+        =/  j  0
+        =/  s  `@rs`.0
+        |-  ^-  @rs
+        ?:  =(j d-head)  s
+        =/  v  `@rs`(cut 5 [(^add base j) 1] x-data)
+        $(j +(j), s (add:rs s (mul:rs v v)))
+      =/  ms     (div:rs ss d-rs)
+      =/  rms-v  (sqrt:rs (add:rs ms eps))
+      ::  Emit D_head values: gamma[j] * x[p,h,j] / rms_v
+      =/  acc-after-h
+        =/  j  0
+        =/  a  acc
+        |-  ^-  (list @)
+        ?:  =(j d-head)  a
+        =/  xv   `@rs`(cut 5 [(^add base j) 1] x-data)
+        =/  gv   `@rs`(cut 5 [j 1] g-data)
+        =/  out  `@`(div:rs (mul:rs gv xv) rms-v)
+        $(j +(j), a [out a])
+      $(h +(h), acc acc-after-h)
+    $(p +(p), vals vals-after-p)
+  ::
+  ::  +reshape-heads: [S, H*D_head] -> [S, H, D_head].
+  ::  Same data layout in memory; just reinterpret the shape. `reshape` from
+  ::  lagoon does this in-place with no copy.
+  ::
+  ++  reshape-heads
+    |=  [x=tensor n-heads=@ud d-head=@ud]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  seq-len  (snag 0 shape.meta.x)
+    (reshape x ~[seq-len n-heads d-head])
+  ::
+  ::  +flatten-heads: [S, H, D_head] -> [S, H*D_head]. Same as reshape-heads
+  ::  in reverse — just reinterpret the 3-D shape as 2-D.
+  ::
+  ++  flatten-heads
+    |=  x=tensor
+    ^-  tensor
+    =,  (lake rnd)
+    =/  seq-len  (snag 0 shape.meta.x)
+    =/  n-heads  (snag 1 shape.meta.x)
+    =/  d-head   (snag 2 shape.meta.x)
+    (reshape x ~[seq-len (^mul n-heads d-head)])
+  ::
+  ::  +gqa-attention: grouped-query attention over pre-RoPE'd q,k,v tensors.
+  ::    q:    [S, n_heads, D_head]
+  ::    k, v: [S, n_kv_heads, D_head]
+  ::    out:  [S, n_heads*D_head] (flattened)
+  ::  Each query head h uses kv head h / (n_heads/n_kv_heads).
+  ::  Standard scaled dot-product attention with causal mask.
+  ::
+  ++  gqa-attention
+    |=  [q=tensor k=tensor v=tensor]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  seq-len     (snag 0 shape.meta.q)
+    =/  n-heads     (snag 1 shape.meta.q)
+    =/  d-head      (snag 2 shape.meta.q)
+    =/  n-kv-heads  (snag 1 shape.meta.k)
+    =/  group       (^div n-heads n-kv-heads)
+    =/  d-model     (^mul n-heads d-head)
+    ::  Stream per-head attention outputs into a flat list in column order
+    ::  out[p, c] where c = h*d_head + j. Linear index = p*d_model + h*d_head + j.
+    ::  Build as a reversed list, then rep at end — avoids set-item on [S, d_model].
+    ::
+    ::  But the per-head output has layout [S, D_h] while the final layout
+    ::  demands [S, d_model]. To write into out[p, :] row-major, we need all
+    ::  n_heads head outputs for row p BEFORE moving to row p+1. Rather than
+    ::  accumulating per-head tensors and then re-streaming, we simply compute
+    ::  all head outputs as [S, D_h] tensors once, then stream row-by-row.
+    =/  head-outs=(list tensor)
+      =/  h  0
+      =|  acc=(list tensor)
+      |-
+      ?:  =(h n-heads)  (flop acc)
+      =/  kv-h  (^div h group)
+      =/  q-h  (extract-head-2d q h)
+      =/  k-h  (extract-head-2d k kv-h)
+      =/  v-h  (extract-head-2d v kv-h)
+      =/  head-out  (attention q-h k-h v-h)          ::  [S, D_h]
+      $(h +(h), acc [head-out acc])
+    ::  Now stream out row-by-row across all heads, packing into one atom.
+    =/  out-meta=meta:ls  [~[seq-len d-model] 5 %i754 ~]
+    =/  vals=(list @)  ~
+    =/  p  0
+    |-  ^-  tensor
+    ?:  =(p seq-len)
+      =/  data-out  (con data:(zeros out-meta) (rep 5 (flop vals)))
+      [out-meta data-out]
+    =/  vals-after-p
+      =/  acc  vals
+      =/  h  0
+      =/  heads  head-outs
+      |-  ^-  (list @)
+      ?~  heads  acc
+      =/  head-data  data.i.heads
+      =/  base       (^mul p d-head)
+      =/  acc-after-head
+        =/  j  0
+        =/  a  acc
+        |-  ^-  (list @)
+        ?:  =(j d-head)  a
+        $(j +(j), a [`@`(cut 5 [(^add base j) 1] head-data) a])
+      $(heads t.heads, h +(h), acc acc-after-head)
+    $(p +(p), vals vals-after-p)
+  ::
+  ::  +extract-head-2d: slice head h out of a [S, H, D_head] tensor into a
+  ::  fresh [S, D_head] tensor without per-element set-item allocations.
+  ::
+  ++  extract-head-2d
+    |=  [x=tensor h=@ud]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  seq-len  (snag 0 shape.meta.x)
+    =/  n-heads  (snag 1 shape.meta.x)
+    =/  d-head   (snag 2 shape.meta.x)
+    =/  x-data   data.x
+    =/  out-meta=meta:ls  [~[seq-len d-head] 5 %i754 ~]
+    =/  vals=(list @)  ~
+    =/  p  0
+    |-  ^-  tensor
+    ?:  =(p seq-len)
+      =/  data-out  (con data:(zeros out-meta) (rep 5 (flop vals)))
+      [out-meta data-out]
+    =/  base  (^mul (^add (^mul p n-heads) h) d-head)
+    =/  vals-after-p
+      =/  j  0
+      =/  acc  vals
+      |-  ^-  (list @)
+      ?:  =(j d-head)  acc
+      $(j +(j), acc [`@`(cut 5 [(^add base j) 1] x-data) acc])
+    $(p +(p), vals vals-after-p)
+  ::
+  ::  +transformer-block-qwen3: one Qwen3 block.
+  ::    1. x1 = rms-norm(x, input-ln)
+  ::    2. q,k,v = proj(x1)  (no bias)
+  ::    3. q,k = reshape to [S,H,D_h]; apply q-norm/k-norm per head
+  ::    4. q,k = apply RoPE (cos,sin precomputed for whole forward)
+  ::    5. attn_out = gqa_attention(q,k,v)
+  ::    6. x = x + o-proj(attn_out)
+  ::    7. x2 = rms-norm(x, post-attn-ln)
+  ::    8. mlp_out = down(silu(gate(x2)) * up(x2))
+  ::    9. x = x + mlp_out
+  ::
+  ++  transformer-block-qwen3
+    |=  $:  x=tensor
+            bw=block-weights-qwen3
+            cfg=model-config-qwen3
+            cos=tensor
+            sin=tensor
+            dbg-first=?
+        ==
+    ^-  tensor
+    ?:  dbg-first  (transformer-block-qwen3-debug x bw cfg cos sin)
+    =,  (lake rnd)
+    =/  x1      (rms-norm-2d x input-ln.bw rms-eps.cfg)
+    =/  q-flat  (linear-nobias x1 q-proj.bw)
+    =/  k-flat  (linear-nobias x1 k-proj.bw)
+    =/  v-flat  (linear-nobias x1 v-proj.bw)
+    =/  q3      (reshape-heads q-flat n-heads.cfg head-dim.cfg)
+    =/  k3      (reshape-heads k-flat n-kv-heads.cfg head-dim.cfg)
+    =/  v3      (reshape-heads v-flat n-kv-heads.cfg head-dim.cfg)
+    =/  q3      (per-head-rms-norm q3 q-norm.bw rms-eps.cfg)
+    =/  k3      (per-head-rms-norm k3 k-norm.bw rms-eps.cfg)
+    =/  q3      (rope-apply q3 cos sin)
+    =/  k3      (rope-apply k3 cos sin)
+    =/  attn    (gqa-attention q3 k3 v3)
+    =/  o       (linear-nobias attn o-proj.bw)
+    =/  x       (add x o)
+    =/  x2      (rms-norm-2d x post-attn-ln.bw rms-eps.cfg)
+    =/  mlp     (swiglu-mlp x2 gate-proj.bw up-proj.bw down-proj.bw)
+    (add x mlp)
+  ::
+  ::  +transformer-block-qwen3-debug: same as above but slogs first-5 of last
+  ::  row at each step. Called only for block 0 to localize divergence from
+  ::  the numpy reference.
+  ::
+  ++  transformer-block-qwen3-debug
+    |=  $:  x=tensor
+            bw=block-weights-qwen3
+            cfg=model-config-qwen3
+            cos=tensor
+            sin=tensor
+        ==
+    ^-  tensor
+    =,  (lake rnd)
+    =/  last-idx  (dec (snag 0 shape.meta.x))
+    =/  dbg5
+      |=  t=tensor  ^-  (list @rs)
+      :~  `@rs`(get-item t ~[last-idx 0])
+          `@rs`(get-item t ~[last-idx 1])
+          `@rs`(get-item t ~[last-idx 2])
+          `@rs`(get-item t ~[last-idx 3])
+          `@rs`(get-item t ~[last-idx 4])
+      ==
+    =/  x1      (rms-norm-2d x input-ln.bw rms-eps.cfg)
+    ~&  ['blk0 ln1' (dbg5 x1)]
+    =/  q-flat  (linear-nobias x1 q-proj.bw)
+    ~&  ['blk0 Q' (dbg5 q-flat)]
+    =/  k-flat  (linear-nobias x1 k-proj.bw)
+    ~&  ['blk0 K' (dbg5 k-flat)]
+    =/  v-flat  (linear-nobias x1 v-proj.bw)
+    ~&  ['blk0 V' (dbg5 v-flat)]
+    =/  q3      (reshape-heads q-flat n-heads.cfg head-dim.cfg)
+    =/  k3      (reshape-heads k-flat n-kv-heads.cfg head-dim.cfg)
+    =/  v3      (reshape-heads v-flat n-kv-heads.cfg head-dim.cfg)
+    ::  3D debug helper: first 5 of (last S, head 0, dim 0..4).
+    =/  dbg3
+      |=  t=tensor  ^-  (list @rs)
+      :~  `@rs`(get-item t ~[last-idx 0 0])
+          `@rs`(get-item t ~[last-idx 0 1])
+          `@rs`(get-item t ~[last-idx 0 2])
+          `@rs`(get-item t ~[last-idx 0 3])
+          `@rs`(get-item t ~[last-idx 0 4])
+      ==
+    ~&  ['blk0 q3 (reshape)' (dbg3 q3)]
+    ~&  ['blk0 k3 (reshape)' (dbg3 k3)]
+    =/  q3      (per-head-rms-norm q3 q-norm.bw rms-eps.cfg)
+    ~&  ['blk0 q3 (after qnorm)' (dbg3 q3)]
+    =/  k3      (per-head-rms-norm k3 k-norm.bw rms-eps.cfg)
+    ~&  ['blk0 k3 (after knorm)' (dbg3 k3)]
+    =/  q3      (rope-apply q3 cos sin)
+    ~&  ['blk0 q3 (after rope)' (dbg3 q3)]
+    =/  k3      (rope-apply k3 cos sin)
+    ~&  ['blk0 k3 (after rope)' (dbg3 k3)]
+    =/  attn    (gqa-attention q3 k3 v3)
+    ~&  ['blk0 attn-concat' (dbg5 attn)]
+    =/  o       (linear-nobias attn o-proj.bw)
+    ~&  ['blk0 o-proj' (dbg5 o)]
+    =/  x       (add x o)
+    ~&  ['blk0 after-res1' (dbg5 x)]
+    =/  x2      (rms-norm-2d x post-attn-ln.bw rms-eps.cfg)
+    ~&  ['blk0 ln2' (dbg5 x2)]
+    =/  mlp     (swiglu-mlp x2 gate-proj.bw up-proj.bw down-proj.bw)
+    ~&  ['blk0 mlp' (dbg5 mlp)]
+    (add x mlp)
+  ::
+  ::  +forward-qwen3: full forward pass through a Qwen3 model.
+  ::    tokens: (list @ud) prompt token IDs
+  ::    returns [1, vocab_size] logits for the last token position
+  ::
+  ++  forward-qwen3
+    |=  [tokens=(list @ud) weights=model-weights-qwen3 cfg=model-config-qwen3]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  seq-len    (lent tokens)
+    =/  last-idx   (dec seq-len)
+    =/  d-model    d-model.cfg
+    ::  Debug helper: first-5 of last row of an [S, D] tensor as (list @rs).
+    =/  dbg5
+      |=  t=tensor  ^-  (list @rs)
+      :~  `@rs`(get-item t ~[last-idx 0])
+          `@rs`(get-item t ~[last-idx 1])
+          `@rs`(get-item t ~[last-idx 2])
+          `@rs`(get-item t ~[last-idx 3])
+          `@rs`(get-item t ~[last-idx 4])
+      ==
+    ::  Build embedding rows by per-token dequant of mlx2 tok-emb. Materializing
+    ::  the full [vocab, d_model] fp32 table would be ~1.2 GB on Bonsai-1.7B;
+    ::  per-row dequant keeps memory at d_model fp32 per token.
+    =/  x  (embed-tied-mlx2 tokens tok-emb.weights cfg)
+    ~&  >  ['QW3 embed last-row first5' (dbg5 x)]
+    ::  Precompute RoPE tables once for whole forward.
+    =/  inv-freq   (rope-inv-freq head-dim.cfg rope-theta.cfg yarn-orig-max-seq.cfg yarn-factor.cfg)
+    =/  attn-fac   (rope-attention-factor yarn-factor.cfg)
+    =/  cs         (rope-cos-sin seq-len head-dim.cfg inv-freq attn-fac)
+    =/  cos        cos.cs
+    =/  sin        sin.cs
+    ::  Run through blocks.
+    =/  blks       blocks.weights
+    =/  blk-idx    0
+    |-  ^-  tensor
+    ?~  blks
+      ::  Final RMSNorm
+      =/  x  (rms-norm-2d x ln-f.weights rms-eps.cfg)
+      ~&  >  ['QW3 after final-LN last-row first5' (dbg5 x)]
+      =/  last-row   (get-row x ~[last-idx])
+      ::  Tied output: logits[v] = dot(x[-1], dequant(wte[v])).
+      ::  Stream over vocab to avoid materializing the full fp32 wte table.
+      (logits-tied-mlx2 last-row tok-emb.weights cfg)
+    =/  x-out  (transformer-block-qwen3 x i.blks cfg cos sin =(0 blk-idx))
+    ~&  >  ['QW3 blk' blk-idx (dbg5 x-out)]
+    $(blks t.blks, x x-out, blk-idx +(blk-idx))
+  ::
+  ::  +embed-tied-mlx2: token embedding lookup for an mlx2-packed wte.
+  ::  Builds [seq_len, d_model] by dequanting only the needed rows.
+  ::
+  ++  embed-tied-mlx2
+    |=  [tokens=(list @ud) wte=weight-tensor cfg=model-config-qwen3]
+    ^-  tensor
+    =,  (lake rnd)
+    ?>  ?=(%mlx2 -.wte)
+    =/  seq-len  (lent tokens)
+    =/  d-model  d-model.cfg
+    =/  out  (zeros [~[seq-len d-model] 5 %i754 ~])
+    =/  i  0
+    =/  toks  tokens
+    |-  ^-  tensor
+    ?~  toks  out
+    =/  row-1d  (dequant-mlx2-row wq.wte scales.wte biases.wte group-size.wte i.toks)
+    =/  row-2d  (reshape row-1d ~[1 d-model])
+    $(toks t.toks, i +(i), out (set-row out ~[i] row-2d))
+  ::
+  ::  +logits-tied-mlx2: compute [1, vocab] logits = x @ wte.T where wte is
+  ::  mlx2-packed [vocab, d_model]. Uses the jetted full-tensor dequant + an
+  ::  ordinary transpose+mmul; materializes the full fp32 wte (~1.2 GB on
+  ::  Bonsai-1.7B), so it needs --loom 33 or larger. Faster than per-row
+  ::  (151k pure-Hoon dequants) by orders of magnitude even with a bigger peak.
+  ::
+  ++  logits-tied-mlx2
+    |=  [last-row=tensor wte=weight-tensor cfg=model-config-qwen3]
+    ^-  tensor
+    =,  (lake rnd)
+    ?>  ?=([%mlx2 *] wte)
+    ::  Calls the top-level jetted +logits-tied-mlx2-fused.
+    (logits-tied-mlx2-fused last-row wq.wte scales.wte biases.wte group-size.wte)
+  ::
+  ::  =======================================================================
+  ::  End of Qwen3 primitives.  Sampling/argmax helpers below are shared.
+  ::  =======================================================================
   ::
   ::  +argmax-token: get the token index with highest logit
   ::

@@ -11,7 +11,7 @@
     math,
     saloon,
     maroon,
-    tokenizer
+    tokenizer=gpt2-tokenizer
 ::
 |%
 +$  versioned-state
@@ -415,6 +415,117 @@
       [%x %encode @ ~]
     ?~  tok  ~
     ``noun+!>((encode:tokenizer u.tok (@t i.t.t.path)))
+    ::  /x/test-transpose-mlx2/noun
+    ::    Dequant block-0 q-proj, then transpose, return first 8 fp32 vals
+    ::    of row 0 of the TRANSPOSED matrix. Isolates whether transpose works
+    ::    on a dequanted tensor.
+      [%x %test-transpose-mlx2 ~]
+    =/  jres  (mule |.(.^(@ %cx /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam)))
+    ?:  ?=(%| -.jres)  ~
+    =/  ws  ;;(model-weights-qwen3:maroon (cue p.jres))
+    =/  blk0   (snag 0 blocks.ws)
+    =/  qproj  q-proj.blk0
+    ?>  ?=([%mlx2 *] qproj)
+    =/  fp  (dequant-mlx2-ray:maroon wq.qproj scales.qproj biases.qproj group-size.qproj)
+    =/  fp-t  fp   :: dequant now produces [in, out] = transposed by construction
+    =/  vals=(list @rs)
+      :~  `@rs`(get-item:la fp-t ~[0 0])
+          `@rs`(get-item:la fp-t ~[0 1])
+          `@rs`(get-item:la fp-t ~[0 2])
+          `@rs`(get-item:la fp-t ~[0 3])
+          `@rs`(get-item:la fp-t ~[0 4])
+          `@rs`(get-item:la fp-t ~[0 5])
+          `@rs`(get-item:la fp-t ~[0 6])
+          `@rs`(get-item:la fp-t ~[0 7])
+      ==
+    ``noun+!>(vals)
+    ::  /x/test-dequant-mlx2/noun
+    ::    Reads /weights/qwen3-bonsai/jam, cues, pulls block 0 q-proj (which
+    ::    is an mlx2-packed weight), dequants it, returns first 8 fp32 values
+    ::    of row 0 as a (list @rs).
+    ::    Compare against numpy reference (saloon/tools/dequant_q_proj.py):
+    ::      [-0.02282715 -0.02282715 -0.02282715 0 0.02282715 -0.02282715 0 0]
+    ::    Exists here so click threads can validate dequant correctness on
+    ::    real weights without /+ importing maroon. Remove when validated.
+    ::  /x/test-dequant-raw/N/noun — dequant q-proj, return all of:
+    ::    - shape of output meta
+    ::    - cut 5 [N 1] data
+    ::    - get-item [0, N]
+    ::    - data's met 3 (byte count)
+    ::  to cross-check get-item vs direct cut.
+      [%x %test-dequant-raw @ ~]
+    =/  jres  (mule |.(.^(@ %cx /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam)))
+    ?:  ?=(%| -.jres)  ~
+    =/  ws  ;;(model-weights-qwen3:maroon (cue p.jres))
+    =/  blk0   (snag 0 blocks.ws)
+    =/  qproj  q-proj.blk0
+    ?.  ?=(%mlx2 -.qproj)  ~
+    =/  deq  (dequant-mlx2-ray:maroon wq.qproj scales.qproj biases.qproj group-size.qproj)
+    =/  n  (slav %ud i.t.t.path)
+    ``noun+!>(`@ux`(get-item:la deq ~[0 n]))
+    ::
+    ::  /x/test-raw-word/N/noun — return w-data word at linear offset N
+    ::  (diagnostic for jet vs hoon layout verification)
+      [%x %test-raw-word @ ~]
+    =/  jres  (mule |.(.^(@ %cx /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam)))
+    ?:  ?=(%| -.jres)  ~
+    =/  ws  ;;(model-weights-qwen3:maroon (cue p.jres))
+    =/  blk0   (snag 0 blocks.ws)
+    =/  qproj  q-proj.blk0
+    ?>  ?=([%mlx2 *] qproj)
+    =/  n  (slav %ud i.t.t.path)
+    ``noun+!>(`@ux`(cut 5 [n 1] data.wq.qproj))
+    ::
+      [%x %test-dequant-mlx2 ~]
+    =/  jres  (mule |.(.^(@ %cx /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam)))
+    ?:  ?=(%| -.jres)  ~
+    =/  ws  ;;(model-weights-qwen3:maroon (cue p.jres))
+    =/  blk0   (snag 0 blocks.ws)
+    =/  qproj  q-proj.blk0
+    ?>  ?=([%mlx2 *] qproj)
+    =/  fp  (dequant-mlx2-ray:maroon wq.qproj scales.qproj biases.qproj group-size.qproj)
+    =/  vals=(list @rs)
+      :~  `@rs`(get-item:la fp ~[0 0])
+          `@rs`(get-item:la fp ~[0 1])
+          `@rs`(get-item:la fp ~[0 2])
+          `@rs`(get-item:la fp ~[0 3])
+          `@rs`(get-item:la fp ~[0 4])
+          `@rs`(get-item:la fp ~[0 5])
+          `@rs`(get-item:la fp ~[0 6])
+          `@rs`(get-item:la fp ~[0 7])
+      ==
+    ``noun+!>(vals)
+    ::  /x/forward-qwen3/<id1>/<id2>/.../noun
+    ::    Reads /weights/qwen3-bonsai/jam, cues to model-weights-qwen3,
+    ::    runs forward on the supplied token IDs, returns next argmax token.
+    ::    Bonsai-1.7B config is hardcoded; this is for testing, not production.
+    ::    Exists here so click threads (which can't /+ import maroon) can drive
+    ::    the forward-qwen3 path; remove when an inference scry surface lands.
+      [%x %forward-qwen3 *]
+    =/  ids=(list @ud)
+      %+  turn  t.t.path
+      |=  n=@ta
+      (slav %ud n)
+    =/  jres  (mule |.(.^(@ %cx /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam)))
+    ?:  ?=(%| -.jres)  ~
+    =/  ws  ;;(model-weights-qwen3:maroon (cue p.jres))
+    =/  cfg=model-config-qwen3:maroon
+      :*  d-model=2.048
+          n-heads=16
+          n-kv-heads=8
+          n-layers=28
+          d-ff=6.144
+          vocab-size=151.669
+          max-seq=32.768
+          head-dim=128
+          rms-eps=.1e-6
+          rope-theta=.1e6
+          yarn-factor=.4
+          yarn-orig-max-seq=8.192
+          bloq=5
+      ==
+    =/  logits  (forward-qwen3:mr:maroon ids ws cfg)
+    ``noun+!>((argmax-token:mr:maroon logits))
   ==
 ::
 ++  on-agent  on-agent:def

@@ -269,6 +269,48 @@
   =/  val  `@`(get-item:la dot ~[0 0])
   $(v +(v), vals [val vals])
 ::
+::  +mmul-mlx2: fused mlx2-dequant+matmul.  y = x @ dequant(w, scales, biases).
+::    x:      [S, in_features] fp32
+::    w:      [out_features, in_features/16] uint32 (2-bit packed)
+::    scales: [out_features, in_features/group_size] fp32
+::    biases: [out_features, in_features/group_size] fp32
+::    output: [S, out_features] fp32
+::
+::  Jetted as %mmul-mlx2.  The C jet routes to backend_mmul_mlx2 which, when
+::  CUDA is built in, runs a fused kernel against VRAM-cached weight buffers
+::  (no per-call dequant materialization).  Pure-Hoon fallback composes the
+::  two jetted primitives we already have — correct but slow.
+::
+++  mmul-mlx2
+  ~/  %mmul-mlx2
+  |=  [x=tensor w=tensor scales=tensor biases=tensor group-size=@ud]
+  ^-  tensor
+  =/  la  (lake %n)
+  (mmul:la x (dequant-mlx2-ray w scales biases group-size))
+::
+::  +rms-norm-row: row-wise RMSNorm on an [S, D] fp32 tensor, applying
+::  gamma[D].  Jetted as %rms-norm-row; GPU path keeps determinism via
+::  sequential fmaf reduction per row.  Hoon fallback composes the
+::  existing saloon primitives; correct but catastrophically slow at
+::  transformer shapes because of per-element set-item on D-wide atoms.
+::
+++  rms-norm-row
+  ~/  %rms-norm-row
+  |=  [x=tensor gamma=tensor eps=@rs]
+  ^-  tensor
+  =/  la  (lake %n)
+  =/  n-rows  (snag 0 shape.meta.x)
+  =/  d       (snag 1 shape.meta.x)
+  =/  i       0
+  =/  out     x
+  |-  ^-  tensor
+  ?:  =(i n-rows)  out
+  =/  row     (get-row:la out ~[i])
+  =/  r1d     (reshape:la row ~[d])
+  =/  normed  (rms-norm:sa:saloon r1d gamma eps)
+  =/  n2d     (reshape:la normed ~[1 d])
+  $(i +(i), out (set-row:la out ~[i] n2d))
+::
 ++  mr
   =+  [rnd=*rounding-mode]
   |%
@@ -608,18 +650,9 @@
   ++  rms-norm-2d
     |=  [x=tensor gamma=tensor eps=@rs]
     ^-  tensor
-    =,  (lake rnd)
-    =/  n-rows  (snag 0 shape.meta.x)
-    =/  d       (snag 1 shape.meta.x)
-    =/  i       0
-    =/  out     x
-    |-  ^-  tensor
-    ?:  =(i n-rows)  out
-    =/  row     (get-row x ~[i])
-    =/  r1d     (reshape row ~[d])
-    =/  normed  (rms-norm:sa:saloon r1d gamma eps)
-    =/  n2d     (reshape normed ~[1 d])
-    $(i +(i), out (set-row out ~[i] n2d))
+    ::  Delegate to the top-level jetted arm.  Keeping this wrapper so
+    ::  existing callers (forward, forward-qwen3) don't have to change.
+    (rms-norm-row x gamma eps)
   ::
   ::  +silu-mul: element-wise silu(a) * b. Used in SwiGLU MLP.
   ::
@@ -655,9 +688,14 @@
     |=  [x=tensor w=weight-tensor]
     ^-  tensor
     =,  (lake rnd)
-    ::  mlx2 dequant emits [in, out] directly (fused transpose), so we can
-    ::  mmul straight through without a separate transpose pass.
-    (mmul x (dequantize w))
+    ::  For %mlx2 weights, route to the fused +mmul-mlx2 — jetted to a single
+    ::  dequant+matmul kernel that runs on GPU with VRAM-cached weights when
+    ::  CUDA is built in.  %fp and %q8 dequant first, then plain mmul.
+    ?-  -.w
+      %fp    (mmul x r.w)
+      %q8    (mmul x (dequant-q8-ray r.w scale.w))
+      %mlx2  (mmul-mlx2 x wq.w scales.w biases.w group-size.w)
+    ==
   ::
   ::  +fast-transpose: in-place shape-wise 2D transpose of a fp32 ray.
   ::  Both lagoon's jetted transpose (has _check oddities) and maroon's
@@ -1016,10 +1054,8 @@
             cfg=model-config-qwen3
             cos=tensor
             sin=tensor
-            dbg-first=?
         ==
     ^-  tensor
-    ?:  dbg-first  (transformer-block-qwen3-debug x bw cfg cos sin)
     =,  (lake rnd)
     =/  x1      (rms-norm-2d x input-ln.bw rms-eps.cfg)
     =/  q-flat  (linear-nobias x1 q-proj.bw)
@@ -1037,70 +1073,6 @@
     =/  x       (add x o)
     =/  x2      (rms-norm-2d x post-attn-ln.bw rms-eps.cfg)
     =/  mlp     (swiglu-mlp x2 gate-proj.bw up-proj.bw down-proj.bw)
-    (add x mlp)
-  ::
-  ::  +transformer-block-qwen3-debug: same as above but slogs first-5 of last
-  ::  row at each step. Called only for block 0 to localize divergence from
-  ::  the numpy reference.
-  ::
-  ++  transformer-block-qwen3-debug
-    |=  $:  x=tensor
-            bw=block-weights-qwen3
-            cfg=model-config-qwen3
-            cos=tensor
-            sin=tensor
-        ==
-    ^-  tensor
-    =,  (lake rnd)
-    =/  last-idx  (dec (snag 0 shape.meta.x))
-    =/  dbg5
-      |=  t=tensor  ^-  (list @rs)
-      :~  `@rs`(get-item t ~[last-idx 0])
-          `@rs`(get-item t ~[last-idx 1])
-          `@rs`(get-item t ~[last-idx 2])
-          `@rs`(get-item t ~[last-idx 3])
-          `@rs`(get-item t ~[last-idx 4])
-      ==
-    =/  x1      (rms-norm-2d x input-ln.bw rms-eps.cfg)
-    ~&  ['blk0 ln1' (dbg5 x1)]
-    =/  q-flat  (linear-nobias x1 q-proj.bw)
-    ~&  ['blk0 Q' (dbg5 q-flat)]
-    =/  k-flat  (linear-nobias x1 k-proj.bw)
-    ~&  ['blk0 K' (dbg5 k-flat)]
-    =/  v-flat  (linear-nobias x1 v-proj.bw)
-    ~&  ['blk0 V' (dbg5 v-flat)]
-    =/  q3      (reshape-heads q-flat n-heads.cfg head-dim.cfg)
-    =/  k3      (reshape-heads k-flat n-kv-heads.cfg head-dim.cfg)
-    =/  v3      (reshape-heads v-flat n-kv-heads.cfg head-dim.cfg)
-    ::  3D debug helper: first 5 of (last S, head 0, dim 0..4).
-    =/  dbg3
-      |=  t=tensor  ^-  (list @rs)
-      :~  `@rs`(get-item t ~[last-idx 0 0])
-          `@rs`(get-item t ~[last-idx 0 1])
-          `@rs`(get-item t ~[last-idx 0 2])
-          `@rs`(get-item t ~[last-idx 0 3])
-          `@rs`(get-item t ~[last-idx 0 4])
-      ==
-    ~&  ['blk0 q3 (reshape)' (dbg3 q3)]
-    ~&  ['blk0 k3 (reshape)' (dbg3 k3)]
-    =/  q3      (per-head-rms-norm q3 q-norm.bw rms-eps.cfg)
-    ~&  ['blk0 q3 (after qnorm)' (dbg3 q3)]
-    =/  k3      (per-head-rms-norm k3 k-norm.bw rms-eps.cfg)
-    ~&  ['blk0 k3 (after knorm)' (dbg3 k3)]
-    =/  q3      (rope-apply q3 cos sin)
-    ~&  ['blk0 q3 (after rope)' (dbg3 q3)]
-    =/  k3      (rope-apply k3 cos sin)
-    ~&  ['blk0 k3 (after rope)' (dbg3 k3)]
-    =/  attn    (gqa-attention q3 k3 v3)
-    ~&  ['blk0 attn-concat' (dbg5 attn)]
-    =/  o       (linear-nobias attn o-proj.bw)
-    ~&  ['blk0 o-proj' (dbg5 o)]
-    =/  x       (add x o)
-    ~&  ['blk0 after-res1' (dbg5 x)]
-    =/  x2      (rms-norm-2d x post-attn-ln.bw rms-eps.cfg)
-    ~&  ['blk0 ln2' (dbg5 x2)]
-    =/  mlp     (swiglu-mlp x2 gate-proj.bw up-proj.bw down-proj.bw)
-    ~&  ['blk0 mlp' (dbg5 mlp)]
     (add x mlp)
   ::
   ::  +forward-qwen3: full forward pass through a Qwen3 model.
@@ -1111,44 +1083,44 @@
     |=  [tokens=(list @ud) weights=model-weights-qwen3 cfg=model-config-qwen3]
     ^-  tensor
     =,  (lake rnd)
-    =/  seq-len    (lent tokens)
-    =/  last-idx   (dec seq-len)
-    =/  d-model    d-model.cfg
-    ::  Debug helper: first-5 of last row of an [S, D] tensor as (list @rs).
-    =/  dbg5
-      |=  t=tensor  ^-  (list @rs)
-      :~  `@rs`(get-item t ~[last-idx 0])
-          `@rs`(get-item t ~[last-idx 1])
-          `@rs`(get-item t ~[last-idx 2])
-          `@rs`(get-item t ~[last-idx 3])
-          `@rs`(get-item t ~[last-idx 4])
-      ==
-    ::  Build embedding rows by per-token dequant of mlx2 tok-emb. Materializing
-    ::  the full [vocab, d_model] fp32 table would be ~1.2 GB on Bonsai-1.7B;
-    ::  per-row dequant keeps memory at d_model fp32 per token.
+    ::  Compose the streamed stages so callers with no HTTP tick budget
+    ::  can still do a whole forward in one call.
+    =/  [x=tensor cos=tensor sin=tensor]
+      (forward-qwen3-embed tokens weights cfg)
+    =/  blks  blocks.weights
+    =/  x-all
+      |-  ^-  tensor
+      ?~  blks  x
+      $(blks t.blks, x (transformer-block-qwen3 x i.blks cfg cos sin))
+    (forward-qwen3-final x tokens weights cfg)
+  ::
+  ::  +forward-qwen3-embed: stage 1 of streamed Qwen3 forward.  Returns the
+  ::  token embeddings and RoPE cos/sin tables that the per-block stage
+  ::  needs.  Agents run this once per prompt, then drive the block loop
+  ::  tick-by-tick with +transformer-block-qwen3.
+  ::
+  ++  forward-qwen3-embed
+    |=  [tokens=(list @ud) weights=model-weights-qwen3 cfg=model-config-qwen3]
+    ^-  [x=tensor cos=tensor sin=tensor]
+    =/  seq-len  (lent tokens)
     =/  x  (embed-tied-mlx2 tokens tok-emb.weights cfg)
-    ~&  >  ['QW3 embed last-row first5' (dbg5 x)]
-    ::  Precompute RoPE tables once for whole forward.
-    =/  inv-freq   (rope-inv-freq head-dim.cfg rope-theta.cfg yarn-orig-max-seq.cfg yarn-factor.cfg)
-    =/  attn-fac   (rope-attention-factor yarn-factor.cfg)
-    =/  cs         (rope-cos-sin seq-len head-dim.cfg inv-freq attn-fac)
-    =/  cos        cos.cs
-    =/  sin        sin.cs
-    ::  Run through blocks.
-    =/  blks       blocks.weights
-    =/  blk-idx    0
-    |-  ^-  tensor
-    ?~  blks
-      ::  Final RMSNorm
-      =/  x  (rms-norm-2d x ln-f.weights rms-eps.cfg)
-      ~&  >  ['QW3 after final-LN last-row first5' (dbg5 x)]
-      =/  last-row   (get-row x ~[last-idx])
-      ::  Tied output: logits[v] = dot(x[-1], dequant(wte[v])).
-      ::  Stream over vocab to avoid materializing the full fp32 wte table.
-      (logits-tied-mlx2 last-row tok-emb.weights cfg)
-    =/  x-out  (transformer-block-qwen3 x i.blks cfg cos sin =(0 blk-idx))
-    ~&  >  ['QW3 blk' blk-idx (dbg5 x-out)]
-    $(blks t.blks, x x-out, blk-idx +(blk-idx))
+    =/  inv-freq  (rope-inv-freq head-dim.cfg rope-theta.cfg yarn-orig-max-seq.cfg yarn-factor.cfg)
+    =/  attn-fac  (rope-attention-factor yarn-factor.cfg)
+    =/  cs        (rope-cos-sin seq-len head-dim.cfg inv-freq attn-fac)
+    [x cos.cs sin.cs]
+  ::
+  ::  +forward-qwen3-final: stage 3 of streamed Qwen3 forward.  Runs the
+  ::  final RMSNorm and the tied output projection over x, producing the
+  ::  [1, vocab_size] logits for the last token.
+  ::
+  ++  forward-qwen3-final
+    |=  [x=tensor tokens=(list @ud) weights=model-weights-qwen3 cfg=model-config-qwen3]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  last-idx  (dec (lent tokens))
+    =/  x-n       (rms-norm-2d x ln-f.weights rms-eps.cfg)
+    =/  last-row  (get-row x-n ~[last-idx])
+    (logits-tied-mlx2 last-row tok-emb.weights cfg)
   ::
   ::  +embed-tied-mlx2: token embedding lookup for an mlx2-packed wte.
   ::  Builds [seq_len, d_model] by dequanting only the needed rows.

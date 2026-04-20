@@ -23,16 +23,22 @@
       last-output=(list @ud)
       tok=(unit tokenizer-maps:tokenizer)
       gen=(unit gen-state)
+      weights-qwen3=(unit model-weights-qwen3:maroon)
+      config-qwen3=(unit model-config-qwen3:maroon)
   ==
-::  NOTE: generation is split across many small behn events (one per
-::  transformer block) solely because a single token's forward pass takes
-::  longer than Vere's ~45s HTTP chunk idle timeout. Doing the whole
-::  forward in one event means no SSE chunks flow while it runs, and the
-::  client connection gets dropped mid-generation. Splitting the work
-::  lets us emit an SSE keepalive comment (`: ping`) between blocks so
-::  the chunk stream never goes idle. When inference gets fast enough
-::  that a token-forward fits in one event under the timeout, this state
-::  machine can collapse back into a single %gen-tick handler.
+::  Generation is tick-based so long CPU forwards don't exceed Vere's ~45s
+::  HTTP chunk idle timeout.  Two tick modes:
+::    %single       - whole forward per tick.  Used when the forward is
+::                    fast enough (GPU-ready models, or any model small
+::                    enough that one token fits under the timeout).
+::    %block-stream - GPT-2 legacy: embed+pos on the first tick, one
+::                    transformer block per subsequent tick, emit
+::                    keepalive pings between ticks.  Needed when the
+::                    CPU forward would exceed the timeout.
+::
+::  Which mode a given load uses lives in +default-tick-mode.  Anything
+::  added to +forward-loaded with no stream impl defaults to %single.
++$  tick-mode  ?(%single %block-stream)
 +$  gen-state
   $:  eyre-id=@ta
       tokens=(list @ud)        ::  prompt + tokens generated so far
@@ -42,9 +48,12 @@
       start=@da                 ::  when generation began
       last-tick=@da             ::  when the last tick event fired
       n-prompt=@ud              ::  length of the original prompt
-      phase=?(%new %block %final)  ::  per-tick state machine
-      block-idx=@ud             ::  next block to compute (when phase=%block)
+      mode=tick-mode
+      phase=?(%new %block %final)  ::  only used when mode = %block-stream
+      block-idx=@ud             ::  next block to compute (mode = %block-stream)
       x=(unit tensor:maroon)    ::  intermediate activations across events
+      cos=(unit tensor:maroon)  ::  RoPE cos table (qwen3 block-stream only)
+      sin=(unit tensor:maroon)  ::  RoPE sin table (qwen3 block-stream only)
   ==
 +$  card  card:agent:gall
 ::
@@ -113,6 +122,49 @@
   =/  verb  (snag (mod eny (lent vs)) vs)
   =/  body  (rap 3 ~[': ' verb '...' (rap 3 ~[10 10])])
   [(met 3 body) body]
+::
+::  Model dispatch.  The orchestration code (HTTP handler, gen-tick)
+::  never references a specific model by name — it goes through these
+::  helpers.  Adding a new model type:
+::    1. add (unit ...) state fields for its weights + config
+::    2. add a clause to +forward-loaded
+::    3. add a clause to +default-tick-mode iff the model needs
+::       block-stream (otherwise it gets %single, which works for any
+::       model whose forward fits under Vere's HTTP chunk timeout).
+::
+::  +model-loaded: does any model have both weights and config?
+::
+++  model-loaded
+  |=  s=state-0
+  ^-  ?
+  ?|  ?&(?=(^ weights-qwen3.s) ?=(^ config-qwen3.s))
+      ?&(?=(^ weights.s) ?=(^ config.s))
+  ==
+::
+::  +forward-loaded: run a whole-forward for the loaded model, returning
+::  logits, or ~ if nothing is loaded.  Called by scries and by the
+::  %single-mode tick.
+::
+++  forward-loaded
+  |=  [s=state-0 tokens=(list @ud)]
+  ^-  (unit tensor:maroon)
+  ?:  ?&(?=(^ weights-qwen3.s) ?=(^ config-qwen3.s))
+    `(forward-qwen3:mr:maroon tokens u.weights-qwen3.s u.config-qwen3.s)
+  ?:  ?&(?=(^ weights.s) ?=(^ config.s))
+    `(forward:mr:maroon tokens u.weights.s u.config.s)
+  ~
+::
+::  +default-tick-mode: per-loaded-model tick strategy.  GPT-2 is the
+::  only backend with a %block-stream implementation today; everything
+::  else defaults to %single.
+::
+++  default-tick-mode
+  |=  s=state-0
+  ^-  tick-mode
+  ::  All current models use the streamed block-by-block path so CPU
+  ::  forwards don't blow the HTTP chunk timeout.  New models with a
+  ::  fast enough single-shot forward can pick %single here.
+  %block-stream
 --
 ::
 %-  agent:dbug
@@ -145,7 +197,6 @@
   ?-  -.p.old
     %0  [rebind-cards this(state +.p.old)]
   ==
-::
 ++  on-poke
   |=  [=mark =vase]
   ^-  (quip card _this)
@@ -217,12 +268,9 @@
       %-  ot:dejs-soft:format
       :~  ['repetition_penalty' num-or-str]
       ==
-    ?~  weights
+    ?.  (model-loaded state)
       :_  this
       (give-http eyre-id 503 ~ (some (as-octs:mimes:html '{"error":"no model loaded"}')))
-    ?~  config
-      :_  this
-      (give-http eyre-id 503 ~ (some (as-octs:mimes:html '{"error":"no model config"}')))
     =/  tokens=(list @ud)
       ?^  tokens-opt  u.tokens-opt
       ?~  prompt-opt  ~
@@ -277,11 +325,12 @@
           [%give %fact ~[/http-response/[eyre-id]] %http-response-data !>(`prompt-event)]
           [%pass /gen-tick %arvo %b %wait now.bowl]
       ==
-    ::  Stash the in-progress generation
+    ::  Stash the in-progress generation, picking tick mode per model.
     =/  new-gen=gen-state
       :*  eyre-id  tokens  n-tokens  strategy  0
           now.bowl  now.bowl  (lent tokens)
-          %new  0  ~
+          (default-tick-mode state)
+          %new  0  ~  ~  ~
       ==
     [cards this(gen `new-gen)]
     ::
@@ -317,6 +366,18 @@
     =/  w  (load-weights:maroon jammed)
     ~&  >  '%maroon model loaded successfully'
     `this(weights `w, config `cfg)
+    ::
+    ::  Load Qwen3 weights (mlx2-quantized). Payload is [qwen3-cfg jam-atom].
+    ::  Weights are cued off the jam atom and stored in state.
+    ::
+      %maroon-load-qwen3
+    =/  payload  !<([model-config-qwen3:maroon @] vase)
+    =/  cfg  -.payload
+    =/  jammed  +.payload
+    ~&  >  "loading qwen3: d={<d-model.cfg>} heads={<n-heads.cfg>} kv-heads={<n-kv-heads.cfg>} layers={<n-layers.cfg>} vocab={<vocab-size.cfg>}"
+    =/  w  ;;(model-weights-qwen3:maroon (cue jammed))
+    ~&  >  '%maroon qwen3 model loaded successfully'
+    `this(weights-qwen3 `w, config-qwen3 `cfg)
     ::
     ::  Load tokenizer from jammed atom (vocab + merges + byte maps)
     ::
@@ -495,6 +556,25 @@
           `@rs`(get-item:la fp ~[0 7])
       ==
     ``noun+!>(vals)
+    ::  /x/qwen3-say/<prompt>/noun — end-to-end inference with decoded output.
+    ::    Encodes <prompt> via the loaded tokenizer, runs forward-qwen3 on the
+    ::    loaded qwen3 weights, returns [next-id=@ud next-text=@t]. Requires
+    ::    prior pokes: %maroon-load-qwen3 and %maroon-load-tokenizer.
+      [%x %qwen3-say @ ~]
+    ?~  weights-qwen3
+      ~&  >>>  'no qwen3 weights loaded — poke %maroon-load-qwen3 first'
+      ~
+    ?~  config-qwen3  ~
+    ?~  tok
+      ~&  >>>  'no tokenizer loaded — poke %maroon-load-tokenizer first'
+      ~
+    =/  prompt=@t  (@t i.t.t.path)
+    =/  ids=(list @ud)  (encode:tokenizer u.tok prompt)
+    =/  logits  (forward-qwen3:mr:maroon ids u.weights-qwen3 u.config-qwen3)
+    =/  next-id  (argmax-token:mr:maroon logits)
+    =/  next-text=@t  (decode:tokenizer u.tok ~[next-id])
+    ``noun+!>([next-id next-text])
+    ::
     ::  /x/forward-qwen3/<id1>/<id2>/.../noun
     ::    Reads /weights/qwen3-bonsai/jam, cues to model-weights-qwen3,
     ::    runs forward on the supplied token IDs, returns next argmax token.
@@ -536,11 +616,7 @@
       [%eyre %connect ~]  `this
       [%gen-tick ~]
     ?~  gen  `this
-    ?~  weights  `this
-    ?~  config  `this
     =/  g  u.gen
-    =/  w  u.weights
-    =/  c  u.config
     =/  la  (lake %n)
     =/  seq-len  (lent tokens.g)
     =/  ping-card=card
@@ -548,72 +624,25 @@
           %http-response-data  !>(`(sse-event-ping (mix eny.bowl step.g)))
       ==
     =/  tick-card=card  [%pass /gen-tick %arvo %b %wait now.bowl]
-    ?-    phase.g
-        %new
-      ::  embed tokens + add positional embeddings.
-      ::  Avoid lagoon's submatrix because `[0 0]` gets parsed as
-      ::  `[start=0 end=unset]` (takes whole dim) — wrong for seq-len=1.
-      ::  Instead, copy the first seq-len rows of pos-emb via get-row/set-row.
-      =/  x0  (embed:mr:maroon tokens.g tok-emb.w bloq.c)
-      =/  d-model  (snag 1 shape.meta.x0)
-      =/  pos=tensor:maroon
-        =/  init  (zeros:la [~[seq-len d-model] bloq.c %i754 ~])
-        =/  i  0
-        |-  ^-  tensor:maroon
-        ?:  =(i seq-len)  init
-        =/  row  (get-row:la pos-emb.w ~[i])
-        $(i +(i), init (set-row:la init ~[i] row))
-      =/  x1  (add:la x0 pos)
-      :_  this(gen `g(phase %block, block-idx 0, x `x1, last-tick now.bowl))
-      ~[ping-card tick-card]
-    ::
-        %block
-      ?~  x.g  `this  ::  defensive
-      =/  blk  (snag block-idx.g blocks.w)
-      =/  x-next  (transformer-block:mr:maroon u.x.g blk n-heads.c)
-      =/  next-idx  +(block-idx.g)
-      =/  n-layers  (lent blocks.w)
-      =/  next-phase=?(%new %block %final)
-        ?:  =(next-idx n-layers)  %final
-        %block
-      :_  %=    this
-            gen
-          `g(phase next-phase, block-idx next-idx, x `x-next, last-tick now.bowl)
-          ==
-      ~[ping-card tick-card]
-    ::
-        %final
-      ?~  x.g  `this  ::  defensive
-      =/  x-norm  (layer-norm-2d:mr:maroon u.x.g ln-f-g.w ln-f-b.w)
-      =/  last-row  (get-row:la x-norm ~[(dec seq-len)])
-      =/  bias-zeros
-        (zeros:la [~[1 vocab-size.c] bloq.c %i754 ~])
-      =/  logits
-        %+  linear:mr:maroon  last-row
-        [[%fp out-proj.w] bias-zeros]
-      =/  flat  (ravel:la logits)
+    ?-    mode.g
+        ::  +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        ::  Single-shot: one tick = one token.  Model-agnostic.
+        ::  +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        %single
+      =/  logits-u  (forward-loaded state tokens.g)
+      ?~  logits-u  `this(gen ~)
       =/  next-tok
-        %:  sample-token:mr:maroon
-          logits  strategy.g  tokens.g
-          (mix eny.bowl step.g)
-        ==
-      =/  text-chunk=@t
-        ?~  tok  ''
-        (decode:tokenizer u.tok ~[next-tok])
+        (sample-token:mr:maroon u.logits-u strategy.g tokens.g (mix eny.bowl step.g))
+      =/  text-chunk=@t  ?~(tok '' (decode:tokenizer u.tok ~[next-tok]))
       =/  total=@dr  (sub now.bowl start.g)
-      ~&  >  :*  'step'  +(step.g)
-                 'tok'   next-tok
-                 'text'  text-chunk
-                 'total'  total
-             ==
-      =/  chunk-json=json
-        :-  %o
-        %-  ~(gas by *(map @t json))
-        :~  ['type' s+'token']
-            ['id' (numb:enjs:format next-tok)]
-            ['text' s+text-chunk]
-        ==
+      ~&  >  ['step' +(step.g) 'tok' next-tok 'text' text-chunk 'total' total]
       =/  token-card=card
+        =/  chunk-json=json
+          :-  %o
+          %-  ~(gas by *(map @t json))
+          :~  ['type' s+'token']  ['id' (numb:enjs:format next-tok)]
+              ['text' s+text-chunk]
+          ==
         :*  %give  %fact  ~[/http-response/[eyre-id.g]]
             %http-response-data
             !>(`(sse-event-data (en:json:html chunk-json)))
@@ -621,19 +650,11 @@
       =/  new-tokens  (snoc tokens.g next-tok)
       =/  remaining   (dec n-remaining.g)
       ?:  =(0 remaining)
-        ::  done
-        =/  gen-toks=(list @ud)  (slag n-prompt.g new-tokens)
-        =/  full-text=@t
-          ?~  tok  ''
-          (decode:tokenizer u.tok gen-toks)
-        ~&  >  :*  'DONE'
-                   'tokens'  (lent gen-toks)
-                   'total'   total
-                   'text'    full-text
-               ==
-        =/  done-json=json
-          [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
+        =/  gen-toks  (slag n-prompt.g new-tokens)
+        =/  full-text=@t  ?~(tok '' (decode:tokenizer u.tok gen-toks))
+        ~&  >  ['DONE tokens' (lent gen-toks) 'total' total 'text' full-text]
         =/  done-card=card
+          =/  done-json=json  [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
           :*  %give  %fact  ~[/http-response/[eyre-id.g]]
               %http-response-data
               !>(`(sse-event-data (en:json:html done-json)))
@@ -641,12 +662,125 @@
         =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
         :_  this(gen ~, last-output new-tokens)
         ~[token-card done-card kick-card]
-      ::  more tokens to go — reset to %new with appended token
-      :_  %=    this
-            gen
-          `g(tokens new-tokens, n-remaining remaining, step +(step.g), last-tick now.bowl, phase %new, block-idx 0, x ~)
-          ==
+      :_  this(gen `g(tokens new-tokens, n-remaining remaining, step +(step.g), last-tick now.bowl))
       ~[token-card tick-card]
+    ::
+        ::  +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        ::  Block-stream: embed on the first tick, one transformer block
+        ::  per subsequent tick, final+sample on the last.  Keepalive
+        ::  pings fire between every tick so the HTTP chunk stream stays
+        ::  alive even under slow CPU forwards.  Each phase dispatches
+        ::  per-model by inspecting which weights are loaded.
+        ::  +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        %block-stream
+      ?-    phase.g
+          %new
+        ::  Qwen3: embed + precompute RoPE cos/sin.
+        ?:  ?&(?=(^ weights-qwen3) ?=(^ config-qwen3))
+          =/  ws   u.weights-qwen3
+          =/  cfg  u.config-qwen3
+          =/  emb  (forward-qwen3-embed:mr:maroon tokens.g ws cfg)
+          :_  this(gen `g(phase %block, block-idx 0, x `x.emb, cos `cos.emb, sin `sin.emb, last-tick now.bowl))
+          ~[ping-card tick-card]
+        ::  GPT-2: embed + positional embeddings.
+        ?~  weights  `this
+        ?~  config   `this
+        =/  w  u.weights
+        =/  c  u.config
+        =/  x0  (embed:mr:maroon tokens.g tok-emb.w bloq.c)
+        =/  d-model  (snag 1 shape.meta.x0)
+        =/  pos=tensor:maroon
+          =/  init  (zeros:la [~[seq-len d-model] bloq.c %i754 ~])
+          =/  i  0
+          |-  ^-  tensor:maroon
+          ?:  =(i seq-len)  init
+          =/  row  (get-row:la pos-emb.w ~[i])
+          $(i +(i), init (set-row:la init ~[i] row))
+        =/  x1  (add:la x0 pos)
+        :_  this(gen `g(phase %block, block-idx 0, x `x1, last-tick now.bowl))
+        ~[ping-card tick-card]
+      ::
+          %block
+        ?~  x.g  `this
+        ::  Qwen3
+        ?:  ?&(?=(^ weights-qwen3) ?=(^ config-qwen3))
+          ?~  cos.g  `this
+          ?~  sin.g  `this
+          =/  ws   u.weights-qwen3
+          =/  cfg  u.config-qwen3
+          =/  blk  (snag block-idx.g blocks.ws)
+          =/  x-next
+            (transformer-block-qwen3:mr:maroon u.x.g blk cfg u.cos.g u.sin.g)
+          =/  next-idx  +(block-idx.g)
+          =/  n-layers  (lent blocks.ws)
+          =/  next-phase=?(%new %block %final)
+            ?:  =(next-idx n-layers)  %final
+            %block
+          :_  this(gen `g(phase next-phase, block-idx next-idx, x `x-next, last-tick now.bowl))
+          ~[ping-card tick-card]
+        ::  GPT-2
+        ?~  weights  `this
+        ?~  config   `this
+        =/  w  u.weights
+        =/  c  u.config
+        =/  blk  (snag block-idx.g blocks.w)
+        =/  x-next  (transformer-block:mr:maroon u.x.g blk n-heads.c)
+        =/  next-idx  +(block-idx.g)
+        =/  n-layers  (lent blocks.w)
+        =/  next-phase=?(%new %block %final)
+          ?:  =(next-idx n-layers)  %final
+          %block
+        :_  this(gen `g(phase next-phase, block-idx next-idx, x `x-next, last-tick now.bowl))
+        ~[ping-card tick-card]
+      ::
+          %final
+        ?~  x.g  `this
+        ::  Compute logits per model.
+        =/  logits=tensor:maroon
+          ?:  ?&(?=(^ weights-qwen3) ?=(^ config-qwen3))
+            (forward-qwen3-final:mr:maroon u.x.g tokens.g u.weights-qwen3 u.config-qwen3)
+          ?~  weights  !!
+          ?~  config   !!
+          =/  w  u.weights
+          =/  c  u.config
+          =/  x-norm  (layer-norm-2d:mr:maroon u.x.g ln-f-g.w ln-f-b.w)
+          =/  last-row  (get-row:la x-norm ~[(dec seq-len)])
+          =/  bias-zeros  (zeros:la [~[1 vocab-size.c] bloq.c %i754 ~])
+          (linear:mr:maroon last-row [[%fp out-proj.w] bias-zeros])
+        =/  next-tok
+          (sample-token:mr:maroon logits strategy.g tokens.g (mix eny.bowl step.g))
+        =/  text-chunk=@t  ?~(tok '' (decode:tokenizer u.tok ~[next-tok]))
+        =/  total=@dr  (sub now.bowl start.g)
+        ~&  >  ['step' +(step.g) 'tok' next-tok 'text' text-chunk 'total' total]
+        =/  token-card=card
+          =/  chunk-json=json
+            :-  %o
+            %-  ~(gas by *(map @t json))
+            :~  ['type' s+'token']  ['id' (numb:enjs:format next-tok)]
+                ['text' s+text-chunk]
+            ==
+          :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+              %http-response-data
+              !>(`(sse-event-data (en:json:html chunk-json)))
+          ==
+        =/  new-tokens  (snoc tokens.g next-tok)
+        =/  remaining   (dec n-remaining.g)
+        ?:  =(0 remaining)
+          =/  gen-toks  (slag n-prompt.g new-tokens)
+          =/  full-text=@t  ?~(tok '' (decode:tokenizer u.tok gen-toks))
+          ~&  >  ['DONE tokens' (lent gen-toks) 'total' total 'text' full-text]
+          =/  done-card=card
+            =/  done-json=json  [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
+            :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+                %http-response-data
+                !>(`(sse-event-data (en:json:html done-json)))
+            ==
+          =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
+          :_  this(gen ~, last-output new-tokens)
+          ~[token-card done-card kick-card]
+        :_  this(gen `g(tokens new-tokens, n-remaining remaining, step +(step.g), last-tick now.bowl, phase %new, block-idx 0, x ~, cos ~, sin ~))
+        ~[token-card tick-card]
+      ==
     ==
   ==
 ++  on-fail   on-fail:def

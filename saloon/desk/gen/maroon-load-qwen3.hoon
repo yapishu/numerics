@@ -1,31 +1,42 @@
-::  Smoke test: cue the qwen3-bonsai single-file jam.
+::  Load Qwen3 (Bonsai-1.7B MLX 2-bit) weights and poke the maroon agent.
 ::
-::  Reads /weights/qwen3-bonsai/jam from Clay (~538 MB), confirms cue succeeds,
-::  shape-probes the top-level. No schema validation yet.
+::  Usage:
+::    =payload +saloon!maroon-load-qwen3
+::    :maroon &maroon-load-qwen3 payload
 ::
-::  Requires 64-bit Vere (32-bit's u3r_met caps single atoms at ~512 MB).
+::  Reads /weights/qwen3-bonsai/jam (~538 MB). Requires 64-bit Vere —
+::  32-bit's u3r_met caps single atoms below that size.
 ::
-::  Usage: +saloon!maroon-load-qwen3
+/-  ls=lagoon
+/+  maroon
 ::
 :-  %say
 |=  [[now=@da eny=@uv bec=beak] ~ ~]
-:-  %noun
+:-  %maroon-load-qwen3
+::
+::  Bonsai-1.7B Qwen3 config (matches config.json of the MLX-2bit variant).
+=/  cfg=model-config-qwen3:maroon
+  :*  d-model=2.048
+      n-heads=16
+      n-kv-heads=8
+      n-layers=28
+      d-ff=6.144
+      vocab-size=151.669
+      max-seq=32.768
+      head-dim=128
+      rms-eps=.1e-6
+      rope-theta=.1e6
+      yarn-factor=.4
+      yarn-orig-max-seq=8.192
+      bloq=5
+  ==
+::
 =/  path  /(scot %p p.bec)/(scot %tas q.bec)/(scot %da now)/weights/qwen3-bonsai/jam
 =/  jam-res  (mule |.(.^(@ %cx path)))
 ?:  ?=(%| -.jam-res)
-  ~|  %need-qwen3-bonsai-jam
+  ~&  >>>  "qwen3-bonsai.jam not found at /weights/qwen3-bonsai.jam"
+  ~|  %no-weights-file
   !!
-~&  >  "loaded qwen3-bonsai.jam ({<(met 3 p.jam-res)>} bytes) — cueing..."
-=/  cue-res  (mule |.((cue p.jam-res)))
-?:  ?=(%| -.cue-res)
-  ~&  >>>  'cue failed (loom?)'
-  ~|  %cue-failed
-  !!
-=/  top  p.cue-res
-~&  >  'cue succeeded'
-~&  >  ?@(top 'WARN: top is atom, expected cell' 'top is cell as expected')
-::  top should be [tok-emb blocks ln-f]
-?@  top  !!
-=/  tok-emb  -.top
-~&  >  ?@(tok-emb 'WARN: tok-emb is atom' [%tok-emb-tag head=-.tok-emb])
-'qwen3-bonsai-smoke-ok'
+=/  jam-atom  p.jam-res
+~&  >  "loaded qwen3-bonsai.jam ({<(met 3 jam-atom)>} bytes)"
+[cfg jam-atom]

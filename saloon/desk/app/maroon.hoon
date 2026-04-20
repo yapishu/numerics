@@ -67,11 +67,14 @@
                                 ::  Same atom on every tick so the VRAM cache
                                 ::  hits; kernel only reads first `seq-len`
                                 ::  rows each call.
-      prev-seq-hash=@ud         ::  KV cache key for the sequence *before* the
-                                ::  most recently sampled token — 0 on first
-                                ::  tick means "no cache yet, run prefill".
-      curr-seq-hash=@ud         ::  KV cache key for the full sequence after
-                                ::  (or, before the first sample, the prompt).
+      kv-session=@ud            ::  unique-per-generation session id;
+                                ::  keys the VRAM-resident KV buffers
+                                ::  shared by prefill + all decode steps.
+      kv-max-seq=@ud            ::  max seq length allocated for KV buffers
+                                ::  at prefill time — decode writes up to here.
+      prefilled=?               ::  has the first forward (populating KV
+                                ::  buffers) already run?  Drives prefill-vs-
+                                ::  decode branching.
   ==
 +$  card  card:agent:gall
 ::
@@ -398,6 +401,12 @@
           [%pass /gen-tick %arvo %b %wait now.bowl]
       ==
     ::  Stash the in-progress generation, picking tick mode per model.
+    ::  Session ID: fresh per generation so simultaneous chats don't
+    ::  collide.  Derived from `eny` so it's unpredictable without
+    ::  tying to content (which would leak across identical prompts).
+    =/  seed=@  (end [0 31] (mix eny.bowl `@`now.bowl))
+    =/  session-id=@ud  ?:(=(0 seed) 1 `@ud`seed)
+    =/  max-seq=@ud  (add (lent tokens) n-tokens)
     =/  new-gen=gen-state
       :*  eyre-id  tokens  n-tokens  strategy  0
           now.bowl  now.bowl  (lent tokens)
@@ -405,8 +414,9 @@
           %new  0  ~  ~  ~  0
           ''                   ::  text-decoded: starts empty
           ~                    ::  rope-cs: lazy-compute on first tick
-          0                    ::  prev-seq-hash: "no cache" sentinel
-          `@ud`(mug tokens)    ::  curr-seq-hash: prompt hash
+          session-id           ::  kv-session
+          max-seq              ::  kv-max-seq
+          |                    ::  prefilled: false until first forward
       ==
     [cards this(gen `new-gen)]
     ::
@@ -720,23 +730,29 @@
         ~
       =/  logits-u=(unit tensor:maroon)
         ?:  ?&(?=(^ weights-qwen3) ?=(^ config-qwen3) ?=(^ rope-cs))
-          ?:  =(0 prev-seq-hash.g)
+          ?.  prefilled.g
+            ::  First forward: prefill allocates KV buffers at max-seq
+            ::  and fills positions 0..prompt_len-1.
             =/  l=tensor:maroon
               %:  forward-qwen3-prefill:mr:maroon
-                tokens.g  u.weights-qwen3  u.config-qwen3  curr-seq-hash.g
+                tokens.g  u.weights-qwen3  u.config-qwen3
+                kv-session.g  kv-max-seq.g
                 cos.u.rope-cs  sin.u.rope-cs
               ==
             `l
+          ::  Decode: writes one new position into the persistent buffers.
           =/  d=(unit tensor:maroon)
             %:  forward-qwen3-decode:mr:maroon
               tokens.g  u.weights-qwen3  u.config-qwen3
-              prev-seq-hash.g  curr-seq-hash.g
+              kv-session.g
               cos.u.rope-cs  sin.u.rope-cs
             ==
           ?^  d  d
+          ::  KV miss (LRU evicted, etc.) — rerun prefill.
           =/  l=tensor:maroon
             %:  forward-qwen3-prefill:mr:maroon
-              tokens.g  u.weights-qwen3  u.config-qwen3  curr-seq-hash.g
+              tokens.g  u.weights-qwen3  u.config-qwen3
+              kv-session.g  kv-max-seq.g
               cos.u.rope-cs  sin.u.rope-cs
             ==
           `l
@@ -791,10 +807,6 @@
         =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
         :_  this(gen ~, last-output new-tokens)
         ~[token-card done-card kick-card]
-      ::  Advance the KV-cache hash chain: the just-used curr-seq-hash
-      ::  becomes next step's prev; curr := hash of the extended sequence.
-      =/  new-prev-hash  curr-seq-hash.g
-      =/  new-curr-hash  `@ud`(mug new-tokens)
       =/  new-g=gen-state
         %=    g
             tokens         new-tokens
@@ -804,8 +816,7 @@
             text-sent      safe-end
             text-decoded   full-text
             rope-cs        rope-cs
-            prev-seq-hash  new-prev-hash
-            curr-seq-hash  new-curr-hash
+            prefilled      &
         ==
       :_  this(gen `new-g)
       ~[token-card tick-card]

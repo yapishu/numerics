@@ -470,7 +470,8 @@
           cfg=model-config-qwen3
           cos=tensor
           sin=tensor
-          seq-hash=@ud
+          session-id=@ud
+          max-seq=@ud
       ==
   ^-  tensor
   =/  blks  blocks
@@ -493,11 +494,10 @@
   |=  $:  x=tensor                        ::  [1, D] for the new token
           blocks=(list block-weights-qwen3)
           cfg=model-config-qwen3
-          cos=tensor                       ::  [pos+1, D_head]
+          cos=tensor                       ::  [>= pos+1, D_head]
           sin=tensor
           position=@ud                     ::  0-indexed new token position
-          prev-seq-hash=@ud                ::  KV key for tokens[0..pos-1]
-          curr-seq-hash=@ud                ::  KV key for tokens[0..pos]
+          session-id=@ud                   ::  KV session key
       ==
   ^-  (unit tensor)
   ~
@@ -1235,7 +1235,7 @@
     ::  can still do a whole forward in one call.
     =/  [x=tensor cos=tensor sin=tensor]
       (forward-qwen3-embed tokens weights cfg)
-    =/  x-all  (run-blocks-qwen3 x blocks.weights cfg cos sin 0)
+    =/  x-all  (run-blocks-qwen3 x blocks.weights cfg cos sin 0 0)
     (forward-qwen3-final x-all tokens weights cfg)
   ::
   ::  +forward-qwen3-embed: stage 1 of streamed Qwen3 forward.  Returns the
@@ -1280,14 +1280,18 @@
     |=  $:  tokens=(list @ud)
             weights=model-weights-qwen3
             cfg=model-config-qwen3
-            seq-hash=@ud
+            session-id=@ud
+            max-seq=@ud
             cos=tensor
             sin=tensor
         ==
     ^-  tensor
     =,  (lake rnd)
     =/  x  (embed-tied-mlx2 tokens tok-emb.weights cfg)
-    =/  x-all  (run-blocks-qwen3 x blocks.weights cfg cos sin seq-hash)
+    =/  x-all
+      %:  run-blocks-qwen3
+        x  blocks.weights  cfg  cos  sin  session-id  max-seq
+      ==
     (forward-qwen3-final x-all tokens weights cfg)
   ::
   ::  +forward-qwen3-final-row: final RMSNorm + tied output projection
@@ -1309,8 +1313,7 @@
     |=  $:  tokens=(list @ud)            ::  full sequence so far (incl. the new token)
             weights=model-weights-qwen3
             cfg=model-config-qwen3
-            prev-seq-hash=@ud
-            curr-seq-hash=@ud
+            session-id=@ud
             cos=tensor                    ::  [>= seq-len, head-dim]
             sin=tensor
         ==
@@ -1329,8 +1332,7 @@
         cos
         sin
         position
-        prev-seq-hash
-        curr-seq-hash
+        session-id
       ==
     ?~  new-x-opt  ~
     `(forward-qwen3-final-row u.new-x-opt weights cfg)

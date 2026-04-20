@@ -687,21 +687,26 @@ fn convert_tokenizer(path: &std::path::Path) -> Result<Noun> {
     // Sort by key so the BST in-order traversal is deterministic.
     vocab_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Include added_tokens (special tokens like <|im_end|>) — these aren't in
-    // the BPE vocab but are part of the tokenizer's full vocab.
+    // Collect special tokens from added_tokens (e.g. <|im_start|>, <|im_end|>).
+    // These get two treatments:
+    //   1. Added to vocab / inverse-vocab so decode can resolve them to text.
+    //   2. Emitted separately in a `specials` field so the Hoon encoder can
+    //      recognize them as verbatim strings and emit their single ID,
+    //      rather than byte-level-encoding each character.
+    let mut specials_pairs: Vec<(String, u64)> = Vec::new();
     if let Some(added) = json.get("added_tokens").and_then(|v| v.as_array()) {
-        let mut added_count = 0;
         for tok in added {
             let id = tok.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
             let content = tok.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.is_empty() { continue; }
+            specials_pairs.push((content.to_string(), id));
             if !vocab_obj.contains_key(content) {
                 vocab_pairs.push((content.to_string(), id));
-                added_count += 1;
             }
         }
-        if added_count > 0 {
+        if !specials_pairs.is_empty() {
             vocab_pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            eprintln!("  added special tokens: {}", added_count);
+            eprintln!("  added special tokens: {}", specials_pairs.len());
         }
     }
 
@@ -778,9 +783,18 @@ fn convert_tokenizer(path: &std::path::Path) -> Result<Noun> {
         .collect();
     let inverse_byte_map_noun = build_tree(ibm_items);
 
-    // [vocab inverse merges byte-map inverse-byte-map]
+    // specials: (tree [@t @ud]) — literal string → token ID.  Hoon side
+    // scans the input for any of these verbatim and emits the ID directly
+    // instead of byte-encoding each char through BPE.
+    specials_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let specials_items: Vec<(Noun, Noun)> = specials_pairs.iter()
+        .map(|(s, id)| (Noun::Atom(str_to_atom(s)), Noun::Atom(Atom::from(*id))))
+        .collect();
+    let specials_noun = build_tree(specials_items);
+
+    // [vocab inverse merges byte-map inverse-byte-map specials]
     Ok(Noun::Cell(Cell::from([
-        vocab_noun, inverse_noun, merges_noun, byte_map_noun, inverse_byte_map_noun,
+        vocab_noun, inverse_noun, merges_noun, byte_map_noun, inverse_byte_map_noun, specials_noun,
     ])))
 }
 

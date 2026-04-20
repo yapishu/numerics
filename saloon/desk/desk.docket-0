@@ -1,0 +1,9 @@
+:~  title+'Maroon'
+    info+'On-ship LLM inference'
+    color+0x2b.2d3a
+    version+[0 1 0]
+    website+'https://github.com/tloncorp/urbit'
+    license+'MIT'
+    base+'maroon'
+    site+/apps/maroon
+==

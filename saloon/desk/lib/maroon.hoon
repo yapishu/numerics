@@ -311,6 +311,213 @@
   =/  n2d     (reshape:la normed ~[1 d])
   $(i +(i), out (set-row:la out ~[i] n2d))
 ::
+::  +rope-apply-row: half-rotated RoPE on an [S, H, D_head] fp32 tensor
+::  given cos/sin [S, D_head] tables.  Jetted as %rope-apply-row.
+::  Pure-Hoon fallback iterates per element — catastrophically slow at
+::  real shapes ((S*H*D_head) ops each touching a D_head-wide atom).
+::  Model-agnostic: any transformer using half-rotated RoPE works.
+::
+++  rope-apply-row
+  ~/  %rope-apply-row
+  |=  [x=tensor cos=tensor sin=tensor]
+  ^-  tensor
+  =/  la  (lake %n)
+  =/  rs  ~(. rs:math [%n .1e-5])
+  =/  seq-len  (snag 0 shape.meta.x)
+  =/  n-heads  (snag 1 shape.meta.x)
+  =/  d-head   (snag 2 shape.meta.x)
+  =/  half     (^div d-head 2)
+  =/  out-meta=meta:ls  [~[seq-len n-heads d-head] 5 %i754 ~]
+  =/  vals=(list @)  ~
+  =/  p  0
+  |-  ^-  tensor
+  ?:  =(p seq-len)
+    =/  data-out  (con data:(zeros:la out-meta) (rep 5 (flop vals)))
+    [out-meta data-out]
+  =/  vals-after-p
+    =/  h  0
+    =/  acc  vals
+    |-  ^-  (list @)
+    ?:  =(h n-heads)  acc
+    =/  acc-after-h
+      =/  j  0
+      =/  acc2  acc
+      |-  ^-  (list @)
+      ?:  =(j d-head)  acc2
+      =/  xj     `@rs`(get-item:la x ~[p h j])
+      =/  cp     `@rs`(get-item:la cos ~[p j])
+      =/  sp     `@rs`(get-item:la sin ~[p j])
+      =/  rj-idx  ?:((^lth j half) (^add j half) (^sub j half))
+      =/  xr     `@rs`(get-item:la x ~[p h rj-idx])
+      =/  rot    ?:((^lth j half) (mul:rs xr .-1) xr)
+      =/  o      `@`(add:rs (mul:rs xj cp) (mul:rs rot sp))
+      $(j +(j), acc2 [o acc2])
+    $(h +(h), acc acc-after-h)
+  $(p +(p), vals vals-after-p)
+::
+::  +softmax-row-ray: row-wise softmax over a flat fp32 tensor.  Jetted
+::  as %softmax-row-ray.  Matches saloon (+softmax a) byte-exact:
+::  subtract max, exp (via Hoon's rs:math +exp algorithm), cumsum,
+::  divide.  Hoon fallback composes the existing saloon primitives.
+::
+++  softmax-row-ray
+  ~/  %softmax-row-ray
+  |=  logits=tensor
+  ^-  tensor
+  (softmax:sa:saloon logits)
+::
+::  +mask-top-p-ray: top-p (nucleus) mask on fp32 logits.  Returns the
+::  same tensor with any logit whose cumulative softmax probability in
+::  descending order falls past p set to -inf.  Jetted to skip the
+::  151-k-element Hoon sort that dominates sampling latency.
+::
+++  mask-top-p-ray
+  ~/  %mask-top-p-ray
+  |=  [logits=tensor p=@rs]
+  ^-  tensor
+  ::  Hoon fallback: delegate to the mr-core implementation.  Slow but
+  ::  correct; GPUs/CPUs running the jet skip the pure-Hoon sort.
+  (mask-top-p:mr logits p)
+::
+::  +sample-from-dist-ray: multinomial sample an index from an fp32
+::  probability tensor + an entropy atom.  Walks cumulative probability
+::  until it passes (eny mod 1e6) / 1e6.  Jetted to avoid 151-k-step
+::  pure-Hoon loop per token.
+::
+++  sample-from-dist-ray
+  ~/  %sample-from-dist-ray
+  |=  [probs=tensor eny=@]
+  ^-  @ud
+  (sample-from-dist:mr probs eny)
+::
+::  +silu-mul-ray: elementwise fused SiLU(a) * b on two same-shape fp32
+::  tensors.  Jetted as %silu-mul-ray.  Used by any SwiGLU-style MLP.
+::
+++  silu-mul-ray
+  ~/  %silu-mul-ray
+  |=  [a=tensor b=tensor]
+  ^-  tensor
+  =/  la  (lake %n)
+  (mul:la (silu:sa:saloon a) b)
+::
+::  +gqa-attention-ray: fused causal grouped-query attention over q, k, v.
+::    q: [S, H, Dh]    query heads
+::    k, v: [S, KH, Dh]  shared KV heads (GQA group = H/KH)
+::    out: [S, H*Dh]   heads concatenated along last dim
+::  Jetted as %gqa-attention-ray.  Hoon fallback composes the existing
+::  primitives; correct but painfully slow — every matmul, softmax, and
+::  reshape runs in pure Hoon.
+::
+++  gqa-attention-ray
+  ~/  %gqa-attention-ray
+  |=  [q=tensor k=tensor v=tensor]
+  ^-  tensor
+  (gqa-attention-hoon:mr q k v)
+::
+::  +embed-tied-mlx2: jet-hinted entrypoint for the token-embedding
+::  lookup step.  Pure-Hoon fallback (embed-tied-mlx2-hoon:mr) loops
+::  per-token with a set-row mutation that is O(S·D²) atom work, which
+::  dominates forward-qwen3 overhead for prompts longer than a few
+::  tokens.  The C jet concatenates the dequanted rows in one pass.
+::
+++  embed-tied-mlx2
+  ~/  %embed-tied-mlx2
+  |=  [tokens=(list @ud) wte=weight-tensor cfg=model-config-qwen3]
+  ^-  tensor
+  (embed-tied-mlx2-hoon:mr tokens wte cfg)
+::
+::  +precompute-rope-cs-qwen3: build a max-seq rope cos/sin pair once
+::  per generation so every tick uses the same atom (VRAM cache hits
+::  unconditionally).  Kernel reads only the first `seq-len` rows, so
+::  oversizing to cover the whole future generation is free at inference
+::  time — only pays the rope-cos-sin jet cost once.
+::
+++  precompute-rope-cs-qwen3
+  |=  [seq-len=@ud cfg=model-config-qwen3]
+  ^-  [cos=tensor sin=tensor]
+  =/  inv-freq
+    %:  rope-inv-freq:mr
+      head-dim.cfg  rope-theta.cfg  yarn-orig-max-seq.cfg  yarn-factor.cfg
+    ==
+  =/  attn-fac  (rope-attention-factor:mr yarn-factor.cfg)
+  (rope-cos-sin seq-len head-dim.cfg inv-freq attn-fac)
+::
+::  +rope-cos-sin: jet-hinted entrypoint for RoPE cos/sin table
+::  construction.  Falls through to +rope-cos-sin-hoon:mr — the
+::  pure-Hoon Taylor-series implementation — when the jet is not
+::  available.  The C jet is a byte-exact port of Hoon's sin:rs /
+::  cos:rs and runs in under a millisecond; pure Hoon takes ~1 second
+::  per forward on seq_len=10, head_dim=64 and is the dominant
+::  non-GPU cost.
+::
+++  rope-cos-sin
+  ~/  %rope-cos-sin
+  |=  [seq-len=@ud head-dim=@ud inv-freq=tensor attn-factor=@rs]
+  ^-  [cos=tensor sin=tensor]
+  (rope-cos-sin-hoon:mr seq-len head-dim inv-freq attn-factor)
+::
+::  +run-blocks-qwen3: jet-hinted entrypoint for the whole-stack Qwen3
+::  block forward.  Runs the entire N-block chain on GPU with x kept
+::  in VRAM between blocks.  When `seq-hash` is non-zero, the prefill
+::  additionally emits K (post-RoPE) and V tensors into the KV cache
+::  keyed on (seq-hash, layer, kind) — subsequent decode steps can
+::  then skip re-running prefill over the whole sequence.
+::
+++  run-blocks-qwen3
+  ~/  %run-blocks-qwen3
+  |=  $:  x=tensor
+          blocks=(list block-weights-qwen3)
+          cfg=model-config-qwen3
+          cos=tensor
+          sin=tensor
+          seq-hash=@ud
+      ==
+  ^-  tensor
+  =/  blks  blocks
+  |-  ^-  tensor
+  ?~  blks  x
+  $(blks t.blks, x (run-block-qwen3 x i.blks cfg cos sin))
+::
+::  +run-decode-qwen3: jet-hinted entrypoint for a single-token decode
+::  step.  Uses the KV cache populated by a prior +run-blocks-qwen3
+::  (seq-hash = prev-seq-hash) to avoid re-running attention over the
+::  full sequence — turns an O(S²) forward into O(S).
+::
+::  Returns `[~ activation]` on the fast path, `~` on KV-cache miss —
+::  caller must fall back to a full +run-blocks-qwen3 over the
+::  extended sequence.  The jet is hinted with a pure-Hoon fallback
+::  (`~` always) so behavior is preserved when the jet is disabled.
+::
+++  run-decode-qwen3
+  ~/  %run-decode-qwen3
+  |=  $:  x=tensor                        ::  [1, D] for the new token
+          blocks=(list block-weights-qwen3)
+          cfg=model-config-qwen3
+          cos=tensor                       ::  [pos+1, D_head]
+          sin=tensor
+          position=@ud                     ::  0-indexed new token position
+          prev-seq-hash=@ud                ::  KV key for tokens[0..pos-1]
+          curr-seq-hash=@ud                ::  KV key for tokens[0..pos]
+      ==
+  ^-  (unit tensor)
+  ~
+::
+::  +run-block-qwen3: jet-hinted entrypoint for the fused per-block
+::  Qwen3 kernel.  Falls through to +transformer-block-qwen3:mr when
+::  the jet is unavailable or any weight has not yet been VRAM-cached
+::  (fallback populates the cache via the existing per-op jets).
+::
+++  run-block-qwen3
+  ~/  %run-block-qwen3
+  |=  $:  x=tensor
+          bw=block-weights-qwen3
+          cfg=model-config-qwen3
+          cos=tensor
+          sin=tensor
+      ==
+  ^-  tensor
+  (transformer-block-qwen3:mr x bw cfg cos sin)
+::
 ++  mr
   =+  [rnd=*rounding-mode]
   |%
@@ -659,8 +866,7 @@
   ++  silu-mul
     |=  [a=tensor b=tensor]
     ^-  tensor
-    =,  (lake rnd)
-    (mul (silu:sa:saloon a) b)
+    (silu-mul-ray a b)
   ::
   ::  +swiglu-mlp: Qwen/Llama gated MLP. No biases.
   ::    hidden = silu(gate-proj(x)) * up-proj(x)
@@ -795,7 +1001,7 @@
   ::    cos[p, j] = cos(angle) * attn_factor
   ::    sin[p, j] = sin(angle) * attn_factor
   ::
-  ++  rope-cos-sin
+  ++  rope-cos-sin-hoon
     |=  [seq-len=@ud head-dim=@ud inv-freq=tensor attn-factor=@rs]
     ^-  [cos=tensor sin=tensor]
     =,  (lake rnd)
@@ -835,42 +1041,7 @@
   ++  rope-apply
     |=  [x=tensor cos=tensor sin=tensor]
     ^-  tensor
-    =,  (lake rnd)
-    =/  rs  ~(. rs:math [%n .1e-5])
-    =/  seq-len  (snag 0 shape.meta.x)
-    =/  n-heads  (snag 1 shape.meta.x)
-    =/  d-head   (snag 2 shape.meta.x)
-    =/  half     (^div d-head 2)
-    ::  Walk (p, h, j) in output row-major (j innermost), computing each value;
-    ::  rep them into one atom at the end. Avoids per-element set-item on a
-    ::  4M-word ray (catastrophic allocation).
-    =/  out-meta=meta:ls  [~[seq-len n-heads d-head] 5 %i754 ~]
-    =/  vals=(list @)  ~
-    =/  p  0
-    |-  ^-  tensor
-    ?:  =(p seq-len)
-      =/  data-out  (con data:(zeros out-meta) (rep 5 (flop vals)))
-      [out-meta data-out]
-    =/  vals-after-p
-      =/  h  0
-      =/  acc  vals
-      |-  ^-  (list @)
-      ?:  =(h n-heads)  acc
-      =/  acc-after-h
-        =/  j  0
-        =/  acc2  acc
-        |-  ^-  (list @)
-        ?:  =(j d-head)  acc2
-        =/  xj     `@rs`(get-item x ~[p h j])
-        =/  cp     `@rs`(get-item cos ~[p j])
-        =/  sp     `@rs`(get-item sin ~[p j])
-        =/  rj-idx  ?:((^lth j half) (^add j half) (^sub j half))
-        =/  xr     `@rs`(get-item x ~[p h rj-idx])
-        =/  rot    ?:((^lth j half) (mul:rs xr .-1) xr)
-        =/  o      `@`(add:rs (mul:rs xj cp) (mul:rs rot sp))
-        $(j +(j), acc2 [o acc2])
-      $(h +(h), acc acc-after-h)
-    $(p +(p), vals vals-after-p)
+    (rope-apply-row x cos sin)
   ::
   ::  +per-head-rms-norm: apply RMSNorm to each head's [D_head] vector.
   ::    x:     [S, H, D_head]
@@ -881,49 +1052,16 @@
     |=  [x=tensor gamma=tensor eps=@rs]
     ^-  tensor
     =,  (lake rnd)
-    =/  rs  ~(. rs:math [%n .1e-5])
+    ::  [S, H, Dh] → [S*H, Dh] and reuse the 2-D row-wise kernel.  The
+    ::  underlying data atom is unchanged by reshape; only meta.shape
+    ::  differs.  Post-call reshape restores the 3-D view.
     =/  seq-len  (snag 0 shape.meta.x)
     =/  n-heads  (snag 1 shape.meta.x)
     =/  d-head   (snag 2 shape.meta.x)
-    =/  x-data   data.x
-    =/  g-data   data.gamma
-    =/  d-rs     (sun:rs d-head)
-    =/  out-meta=meta:ls  [~[seq-len n-heads d-head] 5 %i754 ~]
-    ::  Walk (p, h) pairs. For each, compute rms scalar, then emit D_head vals.
-    =/  vals=(list @)  ~
-    =/  p  0
-    |-  ^-  tensor
-    ?:  =(p seq-len)
-      =/  data-out  (con data:(zeros out-meta) (rep 5 (flop vals)))
-      [out-meta data-out]
-    =/  vals-after-p
-      =/  h  0
-      =/  acc  vals
-      |-  ^-  (list @)
-      ?:  =(h n-heads)  acc
-      =/  base  (^mul (^add (^mul p n-heads) h) d-head)
-      ::  Compute sum of squares for this head.
-      =/  ss
-        =/  j  0
-        =/  s  `@rs`.0
-        |-  ^-  @rs
-        ?:  =(j d-head)  s
-        =/  v  `@rs`(cut 5 [(^add base j) 1] x-data)
-        $(j +(j), s (add:rs s (mul:rs v v)))
-      =/  ms     (div:rs ss d-rs)
-      =/  rms-v  (sqrt:rs (add:rs ms eps))
-      ::  Emit D_head values: gamma[j] * x[p,h,j] / rms_v
-      =/  acc-after-h
-        =/  j  0
-        =/  a  acc
-        |-  ^-  (list @)
-        ?:  =(j d-head)  a
-        =/  xv   `@rs`(cut 5 [(^add base j) 1] x-data)
-        =/  gv   `@rs`(cut 5 [j 1] g-data)
-        =/  out  `@`(div:rs (mul:rs gv xv) rms-v)
-        $(j +(j), a [out a])
-      $(h +(h), acc acc-after-h)
-    $(p +(p), vals vals-after-p)
+    =/  x-flat   (reshape x ~[(^mul seq-len n-heads) d-head])
+    =/  y-flat   (rms-norm-row x-flat gamma eps)
+    (reshape y-flat ~[seq-len n-heads d-head])
+  ::
   ::
   ::  +reshape-heads: [S, H*D_head] -> [S, H, D_head].
   ::  Same data layout in memory; just reinterpret the shape. `reshape` from
@@ -955,7 +1093,17 @@
   ::  Each query head h uses kv head h / (n_heads/n_kv_heads).
   ::  Standard scaled dot-product attention with causal mask.
   ::
+  ::  +gqa-attention: delegates to the top-level jetted +gqa-attention-ray.
   ++  gqa-attention
+    |=  [q=tensor k=tensor v=tensor]
+    ^-  tensor
+    (gqa-attention-ray q k v)
+  ::
+  ::  +gqa-attention-hoon: the pure-Hoon fallback used by +gqa-attention-ray
+  ::  when the jet is unavailable.  Correct but slow — composes attention
+  ::  per-head via existing mr primitives.
+  ::
+  ++  gqa-attention-hoon
     |=  [q=tensor k=tensor v=tensor]
     ^-  tensor
     =,  (lake rnd)
@@ -1087,12 +1235,8 @@
     ::  can still do a whole forward in one call.
     =/  [x=tensor cos=tensor sin=tensor]
       (forward-qwen3-embed tokens weights cfg)
-    =/  blks  blocks.weights
-    =/  x-all
-      |-  ^-  tensor
-      ?~  blks  x
-      $(blks t.blks, x (transformer-block-qwen3 x i.blks cfg cos sin))
-    (forward-qwen3-final x tokens weights cfg)
+    =/  x-all  (run-blocks-qwen3 x blocks.weights cfg cos sin 0)
+    (forward-qwen3-final x-all tokens weights cfg)
   ::
   ::  +forward-qwen3-embed: stage 1 of streamed Qwen3 forward.  Returns the
   ::  token embeddings and RoPE cos/sin tables that the per-block stage
@@ -1107,6 +1251,7 @@
     =/  inv-freq  (rope-inv-freq head-dim.cfg rope-theta.cfg yarn-orig-max-seq.cfg yarn-factor.cfg)
     =/  attn-fac  (rope-attention-factor yarn-factor.cfg)
     =/  cs        (rope-cos-sin seq-len head-dim.cfg inv-freq attn-fac)
+    ::  ^ top-level jet-hinted arm (delegates to rope-cos-sin-hoon:mr).
     [x cos.cs sin.cs]
   ::
   ::  +forward-qwen3-final: stage 3 of streamed Qwen3 forward.  Runs the
@@ -1122,10 +1267,78 @@
     =/  last-row  (get-row x-n ~[last-idx])
     (logits-tied-mlx2 last-row tok-emb.weights cfg)
   ::
+  ::  +forward-qwen3-prefill: full forward + populate KV cache, keyed on
+  ::  `seq-hash`.  Subsequent decode steps can read those cache entries
+  ::  to avoid re-running attention over the whole sequence.
+  ::
+  ::  `cos` / `sin` are precomputed rope tables of shape [>= seq-len,
+  ::  head-dim] — can be bigger than the current seq-len so the same
+  ::  atom can be reused across all ticks of a generation (VRAM cache
+  ::  hits unconditionally).  Kernel only reads the first seq-len rows.
+  ::
+  ++  forward-qwen3-prefill
+    |=  $:  tokens=(list @ud)
+            weights=model-weights-qwen3
+            cfg=model-config-qwen3
+            seq-hash=@ud
+            cos=tensor
+            sin=tensor
+        ==
+    ^-  tensor
+    =,  (lake rnd)
+    =/  x  (embed-tied-mlx2 tokens tok-emb.weights cfg)
+    =/  x-all  (run-blocks-qwen3 x blocks.weights cfg cos sin seq-hash)
+    (forward-qwen3-final x-all tokens weights cfg)
+  ::
+  ::  +forward-qwen3-final-row: final RMSNorm + tied output projection
+  ::  when x is already a single row [1, D] (no need to slice by index).
+  ::
+  ++  forward-qwen3-final-row
+    |=  [x=tensor weights=model-weights-qwen3 cfg=model-config-qwen3]
+    ^-  tensor
+    =,  (lake rnd)
+    =/  x-n   (rms-norm-2d x ln-f.weights rms-eps.cfg)
+    =/  row   (get-row x-n ~[0])
+    (logits-tied-mlx2 row tok-emb.weights cfg)
+  ::
+  ::  +forward-qwen3-decode: single-token decode step against a KV
+  ::  cache populated by a prior +forward-qwen3-prefill / decode.
+  ::  Returns `~` on cache miss — caller must fall back to prefill.
+  ::
+  ++  forward-qwen3-decode
+    |=  $:  tokens=(list @ud)            ::  full sequence so far (incl. the new token)
+            weights=model-weights-qwen3
+            cfg=model-config-qwen3
+            prev-seq-hash=@ud
+            curr-seq-hash=@ud
+            cos=tensor                    ::  [>= seq-len, head-dim]
+            sin=tensor
+        ==
+    ^-  (unit tensor)
+    =,  (lake rnd)
+    =/  seq-len  (lent tokens)
+    ?:  =(0 seq-len)  ~
+    =/  position  (dec seq-len)
+    =/  last-tok  (rear tokens)
+    =/  x-single  (embed-tied-mlx2 ~[last-tok] tok-emb.weights cfg)
+    =/  new-x-opt
+      %:  run-decode-qwen3
+        x-single
+        blocks.weights
+        cfg
+        cos
+        sin
+        position
+        prev-seq-hash
+        curr-seq-hash
+      ==
+    ?~  new-x-opt  ~
+    `(forward-qwen3-final-row u.new-x-opt weights cfg)
+  ::
   ::  +embed-tied-mlx2: token embedding lookup for an mlx2-packed wte.
   ::  Builds [seq_len, d_model] by dequanting only the needed rows.
   ::
-  ++  embed-tied-mlx2
+  ++  embed-tied-mlx2-hoon
     |=  [tokens=(list @ud) wte=weight-tensor cfg=model-config-qwen3]
     ^-  tensor
     =,  (lake rnd)
@@ -1213,13 +1426,13 @@
     =/  logits
       ?:  =(0 top-k.strategy)  logits
       (mask-top-k logits top-k.strategy)
-    ::  4. top-p mask
+    ::  4. top-p mask (jetted — pure Hoon sort over 151k is too slow)
     =/  logits
       ?:  =(.1 top-p.strategy)  logits
-      (mask-top-p logits top-p.strategy)
-    ::  5. softmax + sample
-    =/  probs  (softmax:sa:saloon logits)
-    (sample-from-dist probs eny)
+      (mask-top-p-ray logits top-p.strategy)
+    ::  5. softmax + sample (both jetted)
+    =/  probs  (softmax-row-ray logits)
+    (sample-from-dist-ray probs eny)
   ::
   ::  +sample-from-dist: sample an index from a probability distribution.
   ::  Uses inverse CDF: generate r in [0,1), find first index where cumsum >= r.

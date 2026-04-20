@@ -54,6 +54,24 @@
       x=(unit tensor:maroon)    ::  intermediate activations across events
       cos=(unit tensor:maroon)  ::  RoPE cos table (qwen3 block-stream only)
       sin=(unit tensor:maroon)  ::  RoPE sin table (qwen3 block-stream only)
+      text-sent=@ud             ::  bytes of decoded text emitted to client;
+                                ::  tracks UTF-8 codepoint boundaries so
+                                ::  multi-byte characters never arrive split.
+      text-decoded=@t           ::  incrementally accumulated decoded text of
+                                ::  all generated tokens so far.  Saves having
+                                ::  to re-decode the full token list each step
+                                ::  (O(N) → O(1) per tick).
+      rope-cs=(unit [cos=tensor:maroon sin=tensor:maroon])
+                                ::  precomputed rope cos/sin tables covering
+                                ::  the whole generation's max seq length.
+                                ::  Same atom on every tick so the VRAM cache
+                                ::  hits; kernel only reads first `seq-len`
+                                ::  rows each call.
+      prev-seq-hash=@ud         ::  KV cache key for the sequence *before* the
+                                ::  most recently sampled token — 0 on first
+                                ::  tick means "no cache yet, run prefill".
+      curr-seq-hash=@ud         ::  KV cache key for the full sequence after
+                                ::  (or, before the first sample, the prompt).
   ==
 +$  card  card:agent:gall
 ::
@@ -161,10 +179,45 @@
 ++  default-tick-mode
   |=  s=state-0
   ^-  tick-mode
-  ::  All current models use the streamed block-by-block path so CPU
-  ::  forwards don't blow the HTTP chunk timeout.  New models with a
-  ::  fast enough single-shot forward can pick %single here.
-  %block-stream
+  ::  Qwen3 on GPU runs a full forward in well under a second — faster
+  ::  than ~500 ms of per-tick Gall/behn overhead times 29 ticks.  Ship
+  ::  it as %single.  GPT-2 on CPU still needs %block-stream to stay
+  ::  under the HTTP chunk timeout.  Picks mode per loaded model:
+  ?:  ?&  ?=(^ weights.s)
+          ?=(^ config.s)
+          ?=(~ weights-qwen3.s)
+      ==
+    %block-stream
+  %single
+::
+::  +last-utf8-boundary: largest k <= n such that text[0..k] ends at a
+::  complete UTF-8 codepoint boundary.  Used to hold back partial bytes
+::  of multi-byte characters (emoji etc.) until the next token delivers
+::  the remaining bytes — otherwise the client receives mojibake.
+::
+++  last-utf8-boundary
+  |=  [text=@t n=@ud]
+  ^-  @ud
+  ?:  =(0 n)  0
+  =/  i  (dec n)
+  |-  ^-  @ud
+  =/  b  (cut 3 [i 1] text)
+  ?:  (lth b 0x80)  n                          ::  ASCII at end: complete
+  ?:  =(2 (rsh [0 6] b))                       ::  10xxxxxx continuation
+    ?:  =(0 i)  0
+    $(i (dec i))
+  ::  leading byte b at position i — how many bytes does it start?
+  =/  need
+    ?:  =(6 (rsh [0 5] b))
+      2
+    ?:  =(14 (rsh [0 4] b))
+      3
+    ?:  =(30 (rsh [0 3] b))
+      4
+    1
+  =/  have  (add 1 (sub (dec n) i))
+  ?:  (gte have need)  n
+  i
 --
 ::
 %-  agent:dbug
@@ -186,17 +239,33 @@
 ++  on-load
   |=  old-state=vase
   ^-  (quip card _this)
-  =/  old  (mule |.(!<(versioned-state old-state)))
-  ::  re-bind on every reload to survive agent revives
+  ::  always rebind on every reload so eyre keeps mapping both paths
+  ::  (api + ui) to us across agent revives and vere restarts.
   =/  rebind-cards=(list card)
     :~  [%pass /eyre/connect %arvo %e %connect [~ /apps/maroon/chat] dap.bowl]
     ==
-  ?:  ?=(%| -.old)
-    ~&  >  '%maroon: resetting state on load'
-    [rebind-cards this]
-  ?-  -.p.old
-    %0  [rebind-cards this(state +.p.old)]
-  ==
+  ::  1. Typed vase extract — fast path when the stored type nests under
+  ::  the current one (no schema drift).
+  =/  typed  (mule |.(!<(versioned-state old-state)))
+  ?:  ?=(%& -.typed)
+    ?-  -.p.typed
+      %0  [rebind-cards this(state +.p.typed)]
+    ==
+  ::  2. Structural cast on the raw noun.  Handles the common case where
+  ::  rebuilding /lib/*.hoon invalidates the stored vase's type reference
+  ::  but the underlying noun layout is unchanged — so weights and
+  ::  tokenizer don't need to be reloaded after every commit.
+  =/  raw  (mule |.(;;(versioned-state q.old-state)))
+  ?:  ?=(%& -.raw)
+    ?-  -.p.raw
+      %0
+        ~&  >  '%maroon: on-load recovered state via structural cast'
+        [rebind-cards this(state +.p.raw)]
+    ==
+  ::  3. Real schema change (e.g. tokenizer-maps grew a field) — nothing
+  ::  to salvage structurally.  Reset; reload payloads once.
+  ~&  >>  '%maroon: on-load could not recover state, resetting'
+  [rebind-cards this]
 ++  on-poke
   |=  [=mark =vase]
   ^-  (quip card _this)
@@ -279,7 +348,10 @@
     ?:  =(~ tokens)
       :_  this
       (give-http eyre-id 400 ~ (some (as-octs:mimes:html '{"error":"provide tokens or prompt (and load tokenizer)"}')))
-    =/  n-tokens  (fall n 10)
+    ::  max_tokens: hard upper bound.  Generation also stops early on an
+    ::  EOS token (see %single handler).  Default 128 is a sensible
+    ::  chat default.
+    =/  n-tokens  (fall n 128)
     ::  Defaults: temp=0.7, top-p=0.9, rep-penalty=1.2, top-k disabled.
     ::  Clients can override any of them; setting top_p=1.0 disables it, etc.
     ::  slav %rs needs the `.` prefix (so '.5' parses as 5.0 but '5' bails);
@@ -330,7 +402,11 @@
       :*  eyre-id  tokens  n-tokens  strategy  0
           now.bowl  now.bowl  (lent tokens)
           (default-tick-mode state)
-          %new  0  ~  ~  ~
+          %new  0  ~  ~  ~  0
+          ''                   ::  text-decoded: starts empty
+          ~                    ::  rope-cs: lazy-compute on first tick
+          0                    ::  prev-seq-hash: "no cache" sentinel
+          `@ud`(mug tokens)    ::  curr-seq-hash: prompt hash
       ==
     [cards this(gen `new-gen)]
     ::
@@ -629,11 +705,59 @@
         ::  Single-shot: one tick = one token.  Model-agnostic.
         ::  +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         %single
-      =/  logits-u  (forward-loaded state tokens.g)
+      ::  Qwen3 with KV cache: prefill on first tick, decode thereafter.
+      ::  On cache miss (e.g. LRU-evicted), fall back to a fresh prefill
+      ::  that re-populates cache under curr-seq-hash.
+      ::  Qwen3: precompute rope cos/sin once per generation at max
+      ::  seq length so every tick reuses the same atom.
+      =/  rope-cs=(unit [cos=tensor:maroon sin=tensor:maroon])
+        ?:  ?&(?=(^ weights-qwen3) ?=(^ config-qwen3))
+          ?^  rope-cs.g  rope-cs.g
+          =/  max-seq  (add n-prompt.g n-remaining.g)
+          =/  cs=[cos=tensor:maroon sin=tensor:maroon]
+            (precompute-rope-cs-qwen3:maroon max-seq u.config-qwen3)
+          `cs
+        ~
+      =/  logits-u=(unit tensor:maroon)
+        ?:  ?&(?=(^ weights-qwen3) ?=(^ config-qwen3) ?=(^ rope-cs))
+          ?:  =(0 prev-seq-hash.g)
+            =/  l=tensor:maroon
+              %:  forward-qwen3-prefill:mr:maroon
+                tokens.g  u.weights-qwen3  u.config-qwen3  curr-seq-hash.g
+                cos.u.rope-cs  sin.u.rope-cs
+              ==
+            `l
+          =/  d=(unit tensor:maroon)
+            %:  forward-qwen3-decode:mr:maroon
+              tokens.g  u.weights-qwen3  u.config-qwen3
+              prev-seq-hash.g  curr-seq-hash.g
+              cos.u.rope-cs  sin.u.rope-cs
+            ==
+          ?^  d  d
+          =/  l=tensor:maroon
+            %:  forward-qwen3-prefill:mr:maroon
+              tokens.g  u.weights-qwen3  u.config-qwen3  curr-seq-hash.g
+              cos.u.rope-cs  sin.u.rope-cs
+            ==
+          `l
+        (forward-loaded state tokens.g)
       ?~  logits-u  `this(gen ~)
       =/  next-tok
         (sample-token:mr:maroon u.logits-u strategy.g tokens.g (mix eny.bowl step.g))
-      =/  text-chunk=@t  ?~(tok '' (decode:tokenizer u.tok ~[next-tok]))
+      =/  new-tokens  (snoc tokens.g next-tok)
+      ::  Emit the text delta that ends at a complete UTF-8 codepoint
+      ::  boundary.  Incremental: decode only the new token's bytes and
+      ::  append to the running buffer — O(1) per step instead of re-
+      ::  decoding the entire gen list.
+      =/  gen-so-far  (slag n-prompt.g new-tokens)
+      =/  new-bytes  ?~(tok '' (decode:tokenizer u.tok ~[next-tok]))
+      =/  full-text=@t  (cat 3 text-decoded.g new-bytes)
+      =/  full-bytes  (met 3 full-text)
+      =/  safe-end   (last-utf8-boundary full-text full-bytes)
+      =/  delta-len
+        ?:  (gth safe-end text-sent.g)  (sub safe-end text-sent.g)
+        0
+      =/  text-chunk=@t  (cut 3 [text-sent.g delta-len] full-text)
       =/  total=@dr  (sub now.bowl start.g)
       ~&  >  ['step' +(step.g) 'tok' next-tok 'text' text-chunk 'total' total]
       =/  token-card=card
@@ -647,12 +771,17 @@
             %http-response-data
             !>(`(sse-event-data (en:json:html chunk-json)))
         ==
-      =/  new-tokens  (snoc tokens.g next-tok)
       =/  remaining   (dec n-remaining.g)
-      ?:  =(0 remaining)
-        =/  gen-toks  (slag n-prompt.g new-tokens)
-        =/  full-text=@t  ?~(tok '' (decode:tokenizer u.tok gen-toks))
-        ~&  >  ['DONE tokens' (lent gen-toks) 'total' total 'text' full-text]
+      ::  Stop early on EOS.  Qwen3 emits 151.645 (<|im_end|>) at end of
+      ::  turn and 151.643 (<|endoftext|>) at true EOS; anything else is
+      ::  model-specific, so only these two are hard-coded.  max_tokens
+      ::  still caps the upper bound.
+      =/  eos=?
+        ?|  =(151.645 next-tok)
+            =(151.643 next-tok)
+        ==
+      ?:  ?|(=(0 remaining) eos)
+        ~&  >  ['DONE tokens' (lent gen-so-far) 'total' total 'text' full-text]
         =/  done-card=card
           =/  done-json=json  [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
           :*  %give  %fact  ~[/http-response/[eyre-id.g]]
@@ -662,7 +791,23 @@
         =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
         :_  this(gen ~, last-output new-tokens)
         ~[token-card done-card kick-card]
-      :_  this(gen `g(tokens new-tokens, n-remaining remaining, step +(step.g), last-tick now.bowl))
+      ::  Advance the KV-cache hash chain: the just-used curr-seq-hash
+      ::  becomes next step's prev; curr := hash of the extended sequence.
+      =/  new-prev-hash  curr-seq-hash.g
+      =/  new-curr-hash  `@ud`(mug new-tokens)
+      =/  new-g=gen-state
+        %=    g
+            tokens         new-tokens
+            n-remaining    remaining
+            step           +(step.g)
+            last-tick      now.bowl
+            text-sent      safe-end
+            text-decoded   full-text
+            rope-cs        rope-cs
+            prev-seq-hash  new-prev-hash
+            curr-seq-hash  new-curr-hash
+        ==
+      :_  this(gen `new-g)
       ~[token-card tick-card]
     ::
         ::  +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -710,7 +855,7 @@
           =/  cfg  u.config-qwen3
           =/  blk  (snag block-idx.g blocks.ws)
           =/  x-next
-            (transformer-block-qwen3:mr:maroon u.x.g blk cfg u.cos.g u.sin.g)
+            (run-block-qwen3:maroon u.x.g blk cfg u.cos.g u.sin.g)
           =/  next-idx  +(block-idx.g)
           =/  n-layers  (lent blocks.ws)
           =/  next-phase=?(%new %block %final)

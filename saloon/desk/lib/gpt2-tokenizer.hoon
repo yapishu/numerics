@@ -25,6 +25,7 @@
       merges=tree              ::  [@t @t] -> @ud  (pair -> rank)
       byte-map=tree            ::  @ (byte) -> @t (unicode char)
       inverse-byte-map=tree    ::  @t -> @ (byte)
+      specials=tree            ::  @t -> @ud  (literal string -> special-token ID)
   ==
 ::
 ::  Walk a tree and return all items as a list of cells.
@@ -72,6 +73,7 @@
       merges=(map [@t @t] @ud)
       byte-map=(map @ @t)
       inverse-byte-map=(map @t @)
+      specials=(map @t @ud)
   ==
 ::
 ++  build-maps
@@ -82,6 +84,7 @@
       `(map [@t @t] @ud)`(pair-tree-to-map merges.t)
       `(map @ @t)`(tree-to-map-at byte-map.t)
       `(map @t @)`(tree-to-map-at inverse-byte-map.t)
+      `(map @t @ud)`(tree-to-map-at specials.t)
   ==
 ::
 ::  +cue-tokenizer: load and build maps from a jammed atom.
@@ -327,11 +330,83 @@
   =/  ch  `@t`(add b (lsh [3 1] b2))
   $(bs t.t.bs, out [ch out])
 ::
-::  +encode: text -> list of token IDs
+::  +encode: text -> list of token IDs.
+::    First splits the input on any literal string that appears in
+::    `specials` (e.g. "<|im_start|>", "<|im_end|>", "<think>") and
+::    emits that token ID directly.  The remaining plain segments go
+::    through the normal byte-level-BPE path.
 ::
 ++  encode
   |=  [t=tokenizer-maps text=@t]
   ^-  (list @ud)
+  ?:  =(0 ~(wyt by specials.t))
+    (bpe-encode t text)
+  (encode-split t text)
+::
+::  Recursive split on the earliest special occurrence.
+::
+++  encode-split
+  |=  [t=tokenizer-maps text=@t]
+  ^-  (list @ud)
+  =/  hit  (find-first-special t text)
+  ?~  hit
+    (bpe-encode t text)
+  =/  pre-len  offset.u.hit
+  =/  after-start  (add offset.u.hit slen.u.hit)
+  =/  text-len  (met 3 text)
+  =/  after-len  (sub text-len after-start)
+  =/  before-ids
+    ?:  =(0 pre-len)  ~
+    (bpe-encode t (cut 3 [0 pre-len] text))
+  =/  after-ids
+    ?:  =(0 after-len)  ~
+    $(text (cut 3 [after-start after-len] text))
+  (weld before-ids [id.u.hit after-ids])
+::
+::  Earliest-position / longest-match scan for any known special string.
+::
+++  find-first-special
+  |=  [t=tokenizer-maps text=@t]
+  ^-  (unit [offset=@ud slen=@ud id=@ud])
+  =/  text-len  (met 3 text)
+  =|  best=(unit [offset=@ud slen=@ud id=@ud])
+  =/  specs  ~(tap by specials.t)
+  |-  ^-  (unit [offset=@ud slen=@ud id=@ud])
+  ?~  specs  best
+  =/  spec-s  -.i.specs
+  =/  spec-id  +.i.specs
+  =/  spec-len  (met 3 spec-s)
+  =/  found
+    ?:  |(=(0 spec-len) (gth spec-len text-len))  ~
+    (find-substr text spec-s text-len spec-len)
+  =.  best
+    ?~  found  best
+    ?~  best  `[u.found spec-len spec-id]
+    ?:  (lth u.found offset.u.best)  `[u.found spec-len spec-id]
+    ?:  &(=(u.found offset.u.best) (gth spec-len slen.u.best))
+      `[u.found spec-len spec-id]
+    best
+  $(specs t.specs)
+::
+::  Naive substring search.  Returns ~ if not found.
+::
+++  find-substr
+  |=  [text=@t pat=@t text-len=@ud pat-len=@ud]
+  ^-  (unit @ud)
+  =/  last-start  (sub text-len pat-len)
+  =/  i  0
+  |-
+  ?:  (gth i last-start)  ~
+  =/  sub  (cut 3 [i pat-len] text)
+  ?:  =(sub pat)  `i
+  $(i +(i))
+::
+::  Core byte-level BPE encode: what used to be +encode.
+::
+++  bpe-encode
+  |=  [t=tokenizer-maps text=@t]
+  ^-  (list @ud)
+  ?:  =(0 (met 3 text))  ~
   =/  words  (pre-tokenize text)
   =|  out=(list @ud)
   =/  ws  words

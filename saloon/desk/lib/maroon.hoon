@@ -390,6 +390,57 @@
   ^-  @ud
   (sample-from-dist:mr probs eny)
 ::
+::  +warm-weights: model-agnostic eager VRAM pre-loader.  Takes a flat
+::  list of weight data atoms and probe-or-uploads each into the VRAM
+::  cache.  Idempotent — probe-hit skips work, probe-miss uploads once.
+::  Each data atom's byte length is derived from its own atom size,
+::  so the jet works across architectures without knowing shapes.
+::
+::  Hoon fallback is a no-op (returns 0); the C jet returns the number
+::  of atoms newly uploaded.
+::
+++  warm-weights
+  ~/  %warm-weights
+  |=  data-atoms=(list @)
+  ^-  @ud
+  0
+::
+::  +qwen3-weight-atoms: flatten a Qwen3 weight tree into the flat list
+::  warm-weights expects.  Architecture-specific — other model types
+::  would add their own flattener.
+::
+++  qwen3-weight-atoms
+  |=  ws=model-weights-qwen3
+  ^-  (list @)
+  =|  out=(list @)
+  ::  tied token embedding (mlx2-packed)
+  =.  out  (proj-atoms tok-emb.ws out)
+  =/  blks  blocks.ws
+  |-  ^-  (list @)
+  ?~  blks  out
+  =*  bw  i.blks
+  =.  out  (proj-atoms q-proj.bw out)
+  =.  out  (proj-atoms k-proj.bw out)
+  =.  out  (proj-atoms v-proj.bw out)
+  =.  out  (proj-atoms o-proj.bw out)
+  =.  out  (proj-atoms gate-proj.bw out)
+  =.  out  (proj-atoms up-proj.bw out)
+  =.  out  (proj-atoms down-proj.bw out)
+  =.  out  [data.input-ln.bw out]
+  =.  out  [data.post-attn-ln.bw out]
+  =.  out  [data.q-norm.bw out]
+  =.  out  [data.k-norm.bw out]
+  $(blks t.blks)
+::
+::  Flatten an mlx2 projection into its three data atoms (wq, scales,
+::  biases).  Other quant schemes would have different shapes.
+::
+++  proj-atoms
+  |=  [w=weight-tensor out=(list @)]
+  ^-  (list @)
+  ?.  ?=(%mlx2 -.w)  out
+  [data.wq.w data.scales.w data.biases.w out]
+::
 ::  +apply-sampling-adjust: jet-hinted repetition-penalty + temperature
 ::  scaling over a logits row.  Both steps call `set-item` per-element
 ::  in pure Hoon, which drives the ++sew jet — and the sew jet crashes

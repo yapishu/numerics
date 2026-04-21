@@ -348,6 +348,60 @@
   =/  have  (add 1 (sub (dec n) i))
   ?:  (gte have need)  n
   i
+::
+::  +auto-load-qwen3: scry qwen3 weights + tokenizer from Clay when they
+::  aren't already in state, then pre-warm VRAM.  Top-level helper
+::  (not an agent arm) so the agent door stays at the required 10 arms.
+::
+++  auto-load-qwen3
+  |=  [=bowl:gall s=state-0]
+  ^-  state-0
+  =.  s
+    ?:  ?=(^ weights-qwen3.s)  s
+    =/  path=^path
+      /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam
+    =/  res  (mule |.(.^(@ %cx path)))
+    ?:  ?=(%| -.res)
+      ~&  >>>  '%maroon: qwen3 weights missing (run :maroon &maroon-load-qwen3 +saloon!maroon-load-qwen3)'
+      s
+    =/  cfg=model-config-qwen3:maroon
+      :*  d-model=2.048
+          n-heads=16
+          n-kv-heads=8
+          n-layers=28
+          d-ff=6.144
+          vocab-size=151.669
+          max-seq=32.768
+          head-dim=128
+          rms-eps=.1e-6
+          rope-theta=.1e6
+          yarn-factor=.4
+          yarn-orig-max-seq=8.192
+          bloq=5
+      ==
+    =/  w  ;;(model-weights-qwen3:maroon (cue p.res))
+    ~&  >  '%maroon: auto-loaded qwen3 weights'
+    s(weights-qwen3 `w, config-qwen3 `cfg)
+  =.  s
+    ?:  ?=(^ tok.s)  s
+    =/  path=^path
+      /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-tokenizer/jam
+    =/  res  (mule |.(.^(@ %cx path)))
+    ?:  ?=(%| -.res)
+      ~&  >>>  '%maroon: qwen3 tokenizer missing (run :maroon &maroon-load-tokenizer +saloon!maroon-load-qwen3-tokenizer)'
+      s
+    =/  t  (cue-tokenizer:tokenizer p.res)
+    ~&  >  '%maroon: auto-loaded qwen3 tokenizer'
+    s(tok `t)
+  ::  Pre-warm VRAM: uploads every weight data atom to the cache so the
+  ::  first inference doesn't pay per-block upload cost.  Idempotent on
+  ::  probe-hit; re-uploads cold state if the ship process restarted
+  ::  while the pier kept its weights in loom memory.
+  ?.  ?&(?=(^ weights-qwen3.s) ?=(^ config-qwen3.s))  s
+  =/  n  (warm-weights:maroon (qwen3-weight-atoms:maroon u.weights-qwen3.s))
+  ?:  =(0 n)  s
+  ~&  >  "%maroon: warmed {<n>} weights into VRAM"
+  s
 --
 ::
 %-  agent:dbug
@@ -398,53 +452,8 @@
     ::  3. Real schema change — reset; reload payloads below.
     ~&  >>  '%maroon: on-load could not recover state, resetting'
     *state-0
-  [rebind-cards this(state (auto-load-qwen3 recovered))]
+  [rebind-cards this(state (auto-load-qwen3 bowl recovered))]
 ::
-::  +auto-load-qwen3: scry qwen3 weights + tokenizer from Clay when they
-::  aren't already in state.  Lets a fresh boot of the ship come up
-::  ready to serve /v1/chat/completions without requiring the operator
-::  to run the load generators by hand every time.  Failure is soft —
-::  logs a warning and leaves state as-is so the manual gens still work.
-::
-++  auto-load-qwen3
-  |=  s=state-0
-  ^-  state-0
-  =.  s
-    ?:  ?=(^ weights-qwen3.s)  s
-    =/  path=^path
-      /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam
-    =/  res  (mule |.(.^(@ %cx path)))
-    ?:  ?=(%| -.res)
-      ~&  >>>  '%maroon: qwen3 weights missing (run :maroon &maroon-load-qwen3 +saloon!maroon-load-qwen3)'
-      s
-    =/  cfg=model-config-qwen3:maroon
-      :*  d-model=2.048
-          n-heads=16
-          n-kv-heads=8
-          n-layers=28
-          d-ff=6.144
-          vocab-size=151.669
-          max-seq=32.768
-          head-dim=128
-          rms-eps=.1e-6
-          rope-theta=.1e6
-          yarn-factor=.4
-          yarn-orig-max-seq=8.192
-          bloq=5
-      ==
-    =/  w  ;;(model-weights-qwen3:maroon (cue p.res))
-    ~&  >  '%maroon: auto-loaded qwen3 weights'
-    s(weights-qwen3 `w, config-qwen3 `cfg)
-  ?:  ?=(^ tok.s)  s
-  =/  path=^path
-    /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-tokenizer/jam
-  =/  res  (mule |.(.^(@ %cx path)))
-  ?:  ?=(%| -.res)
-    ~&  >>>  '%maroon: qwen3 tokenizer missing (run :maroon &maroon-load-tokenizer +saloon!maroon-load-qwen3-tokenizer)'
-    s
-  =/  t  (cue-tokenizer:tokenizer p.res)
-  ~&  >  '%maroon: auto-loaded qwen3 tokenizer'
-  s(tok `t)
 ++  on-poke
   |=  [=mark =vase]
   ^-  (quip card _this)
@@ -763,6 +772,9 @@
     ~&  >  "loading qwen3: d={<d-model.cfg>} heads={<n-heads.cfg>} kv-heads={<n-kv-heads.cfg>} layers={<n-layers.cfg>} vocab={<vocab-size.cfg>}"
     =/  w  ;;(model-weights-qwen3:maroon (cue jammed))
     ~&  >  '%maroon qwen3 model loaded successfully'
+    =/  n  (warm-weights:maroon (qwen3-weight-atoms:maroon w))
+    ?.  (gth n 0)  `this(weights-qwen3 `w, config-qwen3 `cfg)
+    ~&  >  "%maroon: warmed {<n>} weights into VRAM"
     `this(weights-qwen3 `w, config-qwen3 `cfg)
     ::
     ::  Load tokenizer from jammed atom (vocab + merges + byte maps)

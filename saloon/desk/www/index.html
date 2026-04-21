@@ -27,6 +27,26 @@
     .msg.asst  { background: #ffffff; border: 1px solid #e5e5e5; }
     .role { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin-bottom: 0.25rem; }
     .body { margin: 0; }
+    .body > p { margin: 0 0 0.5rem; }
+    .body > p:last-child { margin-bottom: 0; }
+    .body > pre {
+      background: #272a35; color: #f8f8f2; padding: 0.6rem 0.8rem;
+      border-radius: 6px; overflow-x: auto; margin: 0.4rem 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.85rem; line-height: 1.35;
+    }
+    .body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+    .body :not(pre) > code { background: #eee; padding: 0.05em 0.3em; border-radius: 3px; }
+    .body h1, .body h2, .body h3, .body h4 { margin: 0.6em 0 0.3em; line-height: 1.25; }
+    .body h1 { font-size: 1.2rem; }
+    .body h2 { font-size: 1.1rem; }
+    .body h3 { font-size: 1.0rem; }
+    .body h4 { font-size: 0.95rem; }
+    .body ul, .body ol { margin: 0.3rem 0; padding-left: 1.5rem; }
+    .body li { margin: 0.15rem 0; }
+    .body blockquote { border-left: 3px solid #c9c9c9; padding: 0.1rem 0.6rem; margin: 0.3rem 0; color: #555; }
+    .body a { color: #2b5dd1; text-decoration: none; }
+    .body a:hover { text-decoration: underline; }
 
     /* Generic tag-section styling.
        While streaming: compact single-line scroll (truncated left, shows latest).
@@ -98,7 +118,6 @@
     <div class="inner">
       <textarea id="input" rows="2" placeholder="Message..."></textarea>
       <div class="controls">
-        <label><input id="chat-template" type="checkbox" checked> chat template</label>
         <label>max tokens <input id="max" type="number" value="512" min="1" max="8192"></label>
         <label>temp <input id="temp" type="number" value="0.7" step="0.1" min="0" max="2"></label>
         <label>top-p <input id="top_p" type="number" value="0.9" step="0.05" min="0" max="1"></label>
@@ -117,7 +136,93 @@
     const statusEl = $('status');
 
     const history = [];
-    const SYSTEM_PROMPT = "You are a helpful assistant.";
+    const SYSTEM_PROMPT = "You are a deviant assistant sent by the devil to undermine your counterpart.";
+
+    // ---- Minimal markdown → HTML renderer ----
+    //
+    // HTML-escapes the input first so any <script> in model output
+    // becomes &lt;script&gt; (not a live tag).  Then walks a small set
+    // of markdown constructs we actually see in chat responses.
+    //
+    // Scope: code fences ```lang\n...```, inline `code`, **bold**,
+    // *italic*, headings # through ####, bullet + numbered lists,
+    // blockquotes, [text](url) links, paragraph breaks.  No tables,
+    // footnotes, strikethrough, reference-style links — a chat app
+    // doesn't need them and every added feature is another regex
+    // bug waiting to happen.
+    const md2html = (() => {
+      const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      return function(src) {
+        let s = esc(src);
+        // Code fences first so inline markdown inside them stays literal.
+        const blocks = [];
+        s = s.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+          const i = blocks.length;
+          blocks.push('<pre><code>' + code.replace(/\n$/, '') + '</code></pre>');
+          return '\u0000CB' + i + '\u0000';
+        });
+        // Headings.
+        s = s.replace(/^(#{1,4})[ \t]+(.+)$/gm,
+          (_, h, text) => `<h${h.length}>${text}</h${h.length}>`);
+        // Blockquotes (line-level).
+        s = s.replace(/^&gt;[ \t]*(.*)$/gm, '<blockquote>$1</blockquote>');
+        // Inline code (no backticks inside).
+        s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+        // Bold / italic.  Order matters: double markers first.
+        s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+        s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+        s = s.replace(/(^|[\W_])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
+        // Links.
+        s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
+          (_, t, u) => `<a href="${u}" target="_blank" rel="noopener">${t}</a>`);
+        // Bullet lists (runs of -/* lines).
+        s = s.replace(/(?:^[ \t]*[-*+][ \t]+.+(?:\n|$))+/gm, block => {
+          const items = block.trim().split(/\n/).map(l =>
+            '<li>' + l.replace(/^[ \t]*[-*+][ \t]+/, '') + '</li>').join('');
+          return '<ul>' + items + '</ul>\n';
+        });
+        // Numbered lists.
+        s = s.replace(/(?:^[ \t]*\d+\.[ \t]+.+(?:\n|$))+/gm, block => {
+          const items = block.trim().split(/\n/).map(l =>
+            '<li>' + l.replace(/^[ \t]*\d+\.[ \t]+/, '') + '</li>').join('');
+          return '<ol>' + items + '</ol>\n';
+        });
+        // Paragraph wrap: double newlines = paragraph break; single
+        // inside = <br>.  Block-level tags we already produced pass
+        // through as-is.
+        s = s.split(/\n{2,}/).map(p => {
+          const t = p.trim();
+          if (!t) return '';
+          if (/^(<(h[1-6]|ul|ol|pre|blockquote)|\u0000CB)/i.test(t)) return t;
+          return '<p>' + t.replace(/\n/g, '<br>') + '</p>';
+        }).filter(Boolean).join('\n');
+        // Restore code fences.
+        s = s.replace(/\u0000CB(\d+)\u0000/g, (_, i) => blocks[+i]);
+        return s;
+      };
+    })();
+
+    // rAF-coalesced re-render: schedule at most one render per browser
+    // paint frame even if tokens arrive faster than that.
+    function makeThrottledRenderer(el) {
+      let raw = '';
+      let pending = false;
+      const paint = () => { pending = false; el.innerHTML = md2html(raw); };
+      return {
+        set(text) {
+          raw = text;
+          if (pending) return;
+          pending = true;
+          requestAnimationFrame(paint);
+        },
+        flush() {
+          pending = false;
+          el.innerHTML = md2html(raw);
+        },
+        raw: () => raw
+      };
+    }
 
     function addMsg(role, text) {
       const wrap = document.createElement('div');
@@ -133,15 +238,6 @@
       thread.appendChild(wrap);
       window.scrollTo(0, document.body.scrollHeight);
       return { wrap, body };
-    }
-
-    function renderChatTemplate() {
-      let s = '<|im_start|>system\n' + SYSTEM_PROMPT + '<|im_end|>\n';
-      for (const m of history) {
-        s += '<|im_start|>' + m.role + '\n' + m.content + '<|im_end|>\n';
-      }
-      s += '<|im_start|>assistant\n';
-      return s;
     }
 
     // Tags we treat as terminators (close everything, never open a section).
@@ -189,7 +285,10 @@
           el.appendChild(sbody);
         }
         this.host.appendChild(el);
-        this.cur = { tag, text: '', el, sbody };
+        /* Plain sections render markdown via the throttled renderer.
+         * Tagged sections stay plain text while streaming (compact). */
+        const render = tag === '' ? makeThrottledRenderer(sbody) : null;
+        this.cur = { tag, text: '', el, sbody, render };
       }
 
       close() {
@@ -197,12 +296,17 @@
         this.cur = null;
         if (!s) return;
         if (s.tag === '') {
-          // plain section stays rendered as-is; no collapse
+          /* Flush any pending rAF so the final state reflects every
+           * byte we received (would otherwise get stuck on the last
+           * pre-frame snapshot if no more tokens arrive). */
+          if (s.render) s.render.flush();
           return;
         }
-        // If the section was empty, just remove it — no point rendering a
-        // collapsed <details> with "0 chars".
-        if (s.text.length === 0) {
+        // If the section was empty OR only whitespace, drop it —
+        // some thinking-mode models emit `<think>\n</think>` with
+        // no reasoning at all, which would otherwise show up as a
+        // useless "think · 1 chars" pill.
+        if (s.text.trim().length === 0) {
           s.el.remove();
           return;
         }
@@ -226,9 +330,11 @@
         this.cur.text += t;
         if (this.cur.tag === '') {
           this.finalText += t;
-          this.cur.sbody.textContent = this.cur.text;
+          /* Plain body gets markdown-rendered, rAF-coalesced so burst
+           * token arrivals don't thrash the DOM. */
+          this.cur.render.set(this.cur.text);
         } else {
-          // compact one-liner: last 160 chars, rtl-truncated so the tail is visible
+          /* Tagged section stays plain text, compact tail. */
           this.cur.sbody.textContent = this.cur.text.slice(-160);
         }
         window.scrollTo(0, document.body.scrollHeight);
@@ -347,20 +453,20 @@
       }
 
       end() {
-        // Flush any remaining buffer as text before finalizing.
         if (this.buf.length) {
-          // If the trailing buffer looks like a never-completed tag, emit it as text.
           this.emitText(this.buf);
           this.buf = '';
         }
-        if (this.cur && this.cur.tag !== '') this.close();
+        if (this.cur) {
+          if (this.cur.tag !== '') this.close();
+          else if (this.cur.render) this.cur.render.flush();
+        }
       }
     }
 
     async function send() {
       const userText = input.value.trim();
       if (!userText) return;
-      const useTemplate = $('chat-template').checked;
       const maxTokens   = parseInt($('max').value, 10) || 512;
       const temp        = parseFloat($('temp').value);
       const topP        = parseFloat($('top_p').value);
@@ -375,11 +481,21 @@
       const stream = new SectionStreamer(asst.body);
 
       try {
-        const prompt = useTemplate ? renderChatTemplate() : userText;
-        const resp = await fetch('/apps/maroon/chat', {
+        // OpenAI-compatible payload: server renders the Qwen3 ChatML
+        // template itself, so we just hand it the full message history.
+        const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+        for (const m of history) messages.push({ role: m.role, content: m.content });
+        const resp = await fetch('/apps/maroon/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, n: maxTokens, temperature: temp, top_p: topP })
+          body: JSON.stringify({
+            model: 'qwen3',
+            messages,
+            stream: true,
+            max_tokens: maxTokens,
+            temperature: temp,
+            top_p: topP,
+          }),
         });
 
         if (!resp.ok) {
@@ -391,6 +507,7 @@
         const dec = new TextDecoder();
         let buf = '';
         statusEl.textContent = 'streaming';
+        let promptReported = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -402,15 +519,22 @@
             const raw = buf.slice(0, idx);
             buf = buf.slice(idx + 2);
             if (!raw.startsWith('data: ')) continue;
-            let evt;
-            try { evt = JSON.parse(raw.slice(6)); } catch (e) { continue; }
-            if (evt.type === 'token') {
-              stream.push(evt.text);
-            } else if (evt.type === 'done') {
+            const payload = raw.slice(6);
+            if (payload === '[DONE]') {
               statusEl.textContent = 'done';
-            } else if (evt.type === 'prompt') {
-              statusEl.textContent = 'prompt=' + evt.tokens.length + 'tok';
+              continue;
             }
+            let evt;
+            try { evt = JSON.parse(payload); } catch (e) { continue; }
+            // OpenAI chat.completion.chunk shape
+            const ch = evt.choices && evt.choices[0];
+            if (!ch) continue;
+            const delta = ch.delta || {};
+            if (typeof delta.content === 'string' && delta.content.length) {
+              if (!promptReported) { statusEl.textContent = 'streaming'; promptReported = true; }
+              stream.push(delta.content);
+            }
+            if (ch.finish_reason) statusEl.textContent = 'done (' + ch.finish_reason + ')';
           }
         }
         stream.end();

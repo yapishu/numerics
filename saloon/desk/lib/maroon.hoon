@@ -390,6 +390,24 @@
   ^-  @ud
   (sample-from-dist:mr probs eny)
 ::
+::  +apply-sampling-adjust: jet-hinted repetition-penalty + temperature
+::  scaling over a logits row.  Both steps call `set-item` per-element
+::  in pure Hoon, which drives the ++sew jet — and the sew jet crashes
+::  in some vere / pier combinations.  The C jet avoids Hoon tensor
+::  mutation entirely.
+::
+::  context tokens are de-duplicated before penalty application.
+::  penalty=.1 or temp=.1 skips the corresponding step.
+::
+++  apply-sampling-adjust
+  ~/  %apply-sampling-adjust
+  |=  [logits=tensor context=(list @ud) penalty=@rs temp=@rs]
+  ^-  tensor
+  =/  la  (lake %n)
+  =/  with-pen  (apply-rep-penalty:mr logits context penalty)
+  ?:  =(.1 temp)  with-pen
+  (div-scalar:la with-pen temp)
+::
 ::  +silu-mul-ray: elementwise fused SiLU(a) * b on two same-shape fp32
 ::  tensors.  Jetted as %silu-mul-ray.  Used by any SwiGLU-style MLP.
 ::
@@ -436,11 +454,27 @@
   |=  [seq-len=@ud cfg=model-config-qwen3]
   ^-  [cos=tensor sin=tensor]
   =/  inv-freq
-    %:  rope-inv-freq:mr
+    %:  rope-inv-freq
       head-dim.cfg  rope-theta.cfg  yarn-orig-max-seq.cfg  yarn-factor.cfg
     ==
   =/  attn-fac  (rope-attention-factor:mr yarn-factor.cfg)
   (rope-cos-sin seq-len head-dim.cfg inv-freq attn-fac)
+::
+::  +rope-inv-freq: jet-hinted entrypoint for the YaRN-scaled inverse-
+::  frequency table.  Falls through to +rope-inv-freq:mr when the jet
+::  is unavailable — that Hoon path exercises log:rs/exp:rs which (in
+::  some vere/pier combinations) dispatch incorrectly through the ++sew
+::  jet and crash the ship.  The C jet is a byte-exact port.
+::
+++  rope-inv-freq
+  ~/  %rope-inv-freq
+  |=  $:  head-dim=@ud
+          base=@rs
+          orig-max=@ud
+          factor=@rs
+      ==
+  ^-  tensor
+  (rope-inv-freq:mr head-dim base orig-max factor)
 ::
 ::  +rope-cos-sin: jet-hinted entrypoint for RoPE cos/sin table
 ::  construction.  Falls through to +rope-cos-sin-hoon:mr — the
@@ -1416,14 +1450,12 @@
             =(.1 rep-penalty.strategy)
         ==
       (argmax-token logits)
-    ::  1. repetition penalty
+    ::  1+2. repetition penalty + temperature (fused + jetted)
     =/  logits
-      ?:  =(.1 rep-penalty.strategy)  logits
-      (apply-rep-penalty logits context rep-penalty.strategy)
-    ::  2. temperature
-    =/  logits
-      ?:  =(.1 temp.strategy)  logits
-      (div-scalar:la logits temp.strategy)
+      %:  apply-sampling-adjust
+        logits  context
+        rep-penalty.strategy  temp.strategy
+      ==
     ::  3. top-k mask
     =/  logits
       ?:  =(0 top-k.strategy)  logits

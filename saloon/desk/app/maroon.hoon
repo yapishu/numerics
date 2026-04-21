@@ -75,6 +75,12 @@
       prefilled=?               ::  has the first forward (populating KV
                                 ::  buffers) already run?  Drives prefill-vs-
                                 ::  decode branching.
+      api=?(%maroon %openai)    ::  response format — legacy %maroon or
+                                ::  OpenAI `chat.completion.chunk` shape
+      stream=?                  ::  SSE-streaming vs buffered single response
+                                ::  (OpenAI `stream` param).  %.y for %maroon.
+      response-id=@t            ::  echoed in every OpenAI chunk as `id`
+      model-name=@t             ::  echoed in every OpenAI chunk as `model`
   ==
 +$  card  card:agent:gall
 ::
@@ -143,6 +149,127 @@
   =/  verb  (snag (mod eny (lent vs)) vs)
   =/  body  (rap 3 ~[': ' verb '...' (rap 3 ~[10 10])])
   [(met 3 body) body]
+::
+::  Unix-epoch seconds from urbit @da — OpenAI `created` field.
+::  Urbit @da counts 2^64-ticks per second from its epoch; ~1970.1.1
+::  is about 291·365·2^64 ticks before that.  The difference in @da
+::  units, right-shifted by 64, gives seconds.
+::
+++  da-to-unix
+  |=  d=@da  ^-  @ud
+  =/  diff  (sub d ~1970.1.1)
+  (rsh [6 1] diff)
+::
+::  Render a Qwen3 ChatML prompt from OpenAI-style messages.
+::  Produces `<|im_start|>{role}\n{content}<|im_end|>\n` per message,
+::  with a trailing `<|im_start|>assistant\n` to prompt the reply.
+::
+++  render-qwen3-chat
+  |=  msgs=(list json)
+  ^-  @t
+  =|  parts=(list @t)
+  |-  ^-  @t
+  ?~  msgs
+    (rap 3 (snoc parts (rap 3 ~['<|im_start|>assistant' 10])))
+  =/  role-opt=(unit @t)
+    %.  i.msgs
+    %-  ot:dejs-soft:format
+    :~  [%role so:dejs-soft:format]
+    ==
+  =/  content-opt=(unit @t)
+    %.  i.msgs
+    %-  ot:dejs-soft:format
+    :~  [%content so:dejs-soft:format]
+    ==
+  ?:  |(?=(~ role-opt) ?=(~ content-opt))
+    $(msgs t.msgs)
+  =/  piece=@t
+    %+  rap  3
+    :~  '<|im_start|>'  u.role-opt  10
+        u.content-opt   '<|im_end|>'  10
+    ==
+  $(msgs t.msgs, parts (snoc parts piece))
+::
+::  OpenAI chat.completion.chunk builder.  `kind` picks the delta
+::  shape (first role chunk / content chunk / final finish_reason).
+::
+++  openai-chunk
+  |=  $:  id=@t
+          model=@t
+          created=@da
+          kind=?(%role %content %final)
+          content=@t
+          finish=@t
+      ==
+  ^-  @t
+  =/  delta-entries=(list [@t json])
+    ?-  kind
+      %role     ~[['role' s+'assistant']]
+      %content  ~[['content' s+content]]
+      %final    ~
+    ==
+  =/  delta=json  [%o (~(gas by *(map @t json)) delta-entries)]
+  =/  choice-entries=(list [@t json])
+    =/  base=(list [@t json])
+      ~[['index' (numb:enjs:format 0)] ['delta' delta]]
+    ?:  ?=(%final kind)
+      (snoc base ['finish_reason' s+finish])
+    base
+  =/  choice=json  [%o (~(gas by *(map @t json)) choice-entries)]
+  =/  obj=json
+    :-  %o
+    %-  ~(gas by *(map @t json))
+    :~  ['id' s+id]
+        ['object' s+'chat.completion.chunk']
+        ['created' (numb:enjs:format (da-to-unix created))]
+        ['model' s+model]
+        ['choices' [%a ~[choice]]]
+    ==
+  (en:json:html obj)
+::
+::  Full (non-streaming) chat.completion body.
+::
+++  openai-completion
+  |=  $:  id=@t
+          model=@t
+          created=@da
+          content=@t
+          finish=@t
+          prompt-tokens=@ud
+          completion-tokens=@ud
+      ==
+  ^-  @t
+  =/  message=json
+    :-  %o
+    %-  ~(gas by *(map @t json))
+    :~  ['role' s+'assistant']
+        ['content' s+content]
+    ==
+  =/  choice=json
+    :-  %o
+    %-  ~(gas by *(map @t json))
+    :~  ['index' (numb:enjs:format 0)]
+        ['message' message]
+        ['finish_reason' s+finish]
+    ==
+  =/  usage=json
+    :-  %o
+    %-  ~(gas by *(map @t json))
+    :~  ['prompt_tokens' (numb:enjs:format prompt-tokens)]
+        ['completion_tokens' (numb:enjs:format completion-tokens)]
+        ['total_tokens' (numb:enjs:format (add prompt-tokens completion-tokens))]
+    ==
+  =/  obj=json
+    :-  %o
+    %-  ~(gas by *(map @t json))
+    :~  ['id' s+id]
+        ['object' s+'chat.completion']
+        ['created' (numb:enjs:format (da-to-unix created))]
+        ['model' s+model]
+        ['choices' [%a ~[choice]]]
+        ['usage' usage]
+    ==
+  (en:json:html obj)
 ::
 ::  Model dispatch.  The orchestration code (HTTP handler, gen-tick)
 ::  never references a specific model by name — it goes through these
@@ -233,9 +360,10 @@
 ::
 ++  on-init
   ^-  (quip card _this)
-  ~&  >  '%maroon initialized — bound at /apps/maroon/chat'
+  ~&  >  '%maroon initialized — bound at /apps/maroon/chat + /apps/maroon/v1'
   :_  this
   :~  [%pass /eyre/connect %arvo %e %connect [~ /apps/maroon/chat] dap.bowl]
+      [%pass /eyre/connect-v1 %arvo %e %connect [~ /apps/maroon/v1] dap.bowl]
   ==
 ::
 ++  on-save   !>(state)
@@ -246,29 +374,77 @@
   ::  (api + ui) to us across agent revives and vere restarts.
   =/  rebind-cards=(list card)
     :~  [%pass /eyre/connect %arvo %e %connect [~ /apps/maroon/chat] dap.bowl]
+        [%pass /eyre/connect-v1 %arvo %e %connect [~ /apps/maroon/v1] dap.bowl]
     ==
   ::  1. Typed vase extract — fast path when the stored type nests under
   ::  the current one (no schema drift).
-  =/  typed  (mule |.(!<(versioned-state old-state)))
-  ?:  ?=(%& -.typed)
-    ?-  -.p.typed
-      %0  [rebind-cards this(state +.p.typed)]
-    ==
-  ::  2. Structural cast on the raw noun.  Handles the common case where
-  ::  rebuilding /lib/*.hoon invalidates the stored vase's type reference
-  ::  but the underlying noun layout is unchanged — so weights and
-  ::  tokenizer don't need to be reloaded after every commit.
-  =/  raw  (mule |.(;;(versioned-state q.old-state)))
-  ?:  ?=(%& -.raw)
-    ?-  -.p.raw
-      %0
-        ~&  >  '%maroon: on-load recovered state via structural cast'
-        [rebind-cards this(state +.p.raw)]
-    ==
-  ::  3. Real schema change (e.g. tokenizer-maps grew a field) — nothing
-  ::  to salvage structurally.  Reset; reload payloads once.
-  ~&  >>  '%maroon: on-load could not recover state, resetting'
-  [rebind-cards this]
+  =/  recovered=state-0
+    =/  typed  (mule |.(!<(versioned-state old-state)))
+    ?:  ?=(%& -.typed)
+      ?-  -.p.typed
+        %0  +.p.typed
+      ==
+    ::  2. Structural cast on the raw noun.  Handles the common case where
+    ::  rebuilding /lib/*.hoon invalidates the stored vase's type reference
+    ::  but the underlying noun layout is unchanged — so weights and
+    ::  tokenizer don't need to be reloaded after every commit.
+    =/  raw  (mule |.(;;(versioned-state q.old-state)))
+    ?:  ?=(%& -.raw)
+      ?-  -.p.raw
+        %0
+          ~&  >  '%maroon: on-load recovered state via structural cast'
+          +.p.raw
+      ==
+    ::  3. Real schema change — reset; reload payloads below.
+    ~&  >>  '%maroon: on-load could not recover state, resetting'
+    *state-0
+  [rebind-cards this(state (auto-load-qwen3 recovered))]
+::
+::  +auto-load-qwen3: scry qwen3 weights + tokenizer from Clay when they
+::  aren't already in state.  Lets a fresh boot of the ship come up
+::  ready to serve /v1/chat/completions without requiring the operator
+::  to run the load generators by hand every time.  Failure is soft —
+::  logs a warning and leaves state as-is so the manual gens still work.
+::
+++  auto-load-qwen3
+  |=  s=state-0
+  ^-  state-0
+  =.  s
+    ?:  ?=(^ weights-qwen3.s)  s
+    =/  path=^path
+      /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-bonsai/jam
+    =/  res  (mule |.(.^(@ %cx path)))
+    ?:  ?=(%| -.res)
+      ~&  >>>  '%maroon: qwen3 weights missing (run :maroon &maroon-load-qwen3 +saloon!maroon-load-qwen3)'
+      s
+    =/  cfg=model-config-qwen3:maroon
+      :*  d-model=2.048
+          n-heads=16
+          n-kv-heads=8
+          n-layers=28
+          d-ff=6.144
+          vocab-size=151.669
+          max-seq=32.768
+          head-dim=128
+          rms-eps=.1e-6
+          rope-theta=.1e6
+          yarn-factor=.4
+          yarn-orig-max-seq=8.192
+          bloq=5
+      ==
+    =/  w  ;;(model-weights-qwen3:maroon (cue p.res))
+    ~&  >  '%maroon: auto-loaded qwen3 weights'
+    s(weights-qwen3 `w, config-qwen3 `cfg)
+  ?:  ?=(^ tok.s)  s
+  =/  path=^path
+    /(scot %p our.bowl)/saloon/(scot %da now.bowl)/weights/qwen3-tokenizer/jam
+  =/  res  (mule |.(.^(@ %cx path)))
+  ?:  ?=(%| -.res)
+    ~&  >>>  '%maroon: qwen3 tokenizer missing (run :maroon &maroon-load-tokenizer +saloon!maroon-load-qwen3-tokenizer)'
+    s
+  =/  t  (cue-tokenizer:tokenizer p.res)
+  ~&  >  '%maroon: auto-loaded qwen3 tokenizer'
+  s(tok `t)
 ++  on-poke
   |=  [=mark =vase]
   ^-  (quip card _this)
@@ -281,6 +457,11 @@
     =+  !<([eyre-id=@ta req=inbound-request:eyre] vase)
     =/  rl=request-line:server  (parse-request-line:server url.request.req)
     =/  site=(list @t)  site.rl
+    ::  OpenAI-compatible endpoint takes precedence over legacy match
+    ::  (the /v1 path is bound separately so it can't fall through to
+    ::  /chat's [%apps %maroon %chat *] guard even as a prefix).
+    ?:  ?=([%apps %maroon %v1 %chat %completions ~] site)
+      (handle-openai eyre-id req)
     ?.  ?=([%apps %maroon %chat *] site)
       :_  this
       (not-found eyre-id)
@@ -417,6 +598,10 @@
           session-id           ::  kv-session
           max-seq              ::  kv-max-seq
           |                    ::  prefilled: false until first forward
+          %maroon              ::  api: legacy format
+          &                    ::  stream: always SSE for legacy
+          ''                   ::  response-id: unused for %maroon
+          ''                   ::  model-name: unused for %maroon
       ==
     [cards this(gen `new-gen)]
     ::
@@ -442,6 +627,121 @@
       ^-  (list card)
       =/  msg  'POST JSON {"tokens":[...], "n":N, "temperature":T?} to this endpoint'
       (give-http eyre-id 200 ~[['content-type' 'text/plain']] (some (as-octs:mimes:html msg)))
+    ::
+    ::  POST /apps/maroon/v1/chat/completions — OpenAI-compatible chat.
+    ::
+    ++  handle-openai
+      |=  [eyre-id=@ta req=inbound-request:eyre]
+      ^-  (quip card _this)
+      ?.  =(%'POST' method.request.req)
+        :_  this
+        (give-http eyre-id 405 ~[['content-type' 'text/plain']] (some (as-octs:mimes:html 'method not allowed')))
+      =/  body  ?~(body.request.req '' q.u.body.request.req)
+      =/  parsed=(unit json)  (de:json:html body)
+      ?~  parsed
+        :_  this
+        (give-http eyre-id 400 ~[['content-type' 'application/json']] (some (as-octs:mimes:html '{"error":"invalid JSON"}')))
+      =/  msgs-opt=(unit (list json))
+        %.  u.parsed
+        %-  ot:dejs-soft:format
+        :~  [%messages (ar:dejs-soft:format |=(j=json `(unit json)`(some j)))]
+        ==
+      ?~  msgs-opt
+        :_  this
+        (give-http eyre-id 400 ~[['content-type' 'application/json']] (some (as-octs:mimes:html '{"error":"messages required"}')))
+      =/  stream-opt=(unit ?)
+        %.  u.parsed
+        %-  ot:dejs-soft:format
+        :~  [%stream bo:dejs-soft:format]
+        ==
+      =/  model-opt=(unit @t)
+        %.  u.parsed
+        %-  ot:dejs-soft:format
+        :~  [%model so:dejs-soft:format]
+        ==
+      =/  max-tokens-opt=(unit @ud)
+        %.  u.parsed
+        %-  ot:dejs-soft:format
+        :~  ['max_tokens' ni:dejs-soft:format]
+        ==
+      =/  num-or-str=$-(json (unit @ta))
+        |=  j=json  ^-  (unit @ta)
+        ?+  j  ~
+          [%n *]  `p.j
+          [%s *]  `p.j
+        ==
+      =/  temperature=(unit @ta)
+        %.  u.parsed
+        %-  ot:dejs-soft:format
+        :~  [%temperature num-or-str]
+        ==
+      =/  top-p-opt=(unit @ta)
+        %.  u.parsed
+        %-  ot:dejs-soft:format
+        :~  ['top_p' num-or-str]
+        ==
+      ?.  (model-loaded state)
+        :_  this
+        (give-http eyre-id 503 ~[['content-type' 'application/json']] (some (as-octs:mimes:html '{"error":"no model loaded"}')))
+      ?~  tok
+        :_  this
+        (give-http eyre-id 503 ~[['content-type' 'application/json']] (some (as-octs:mimes:html '{"error":"no tokenizer loaded"}')))
+      =/  prompt-text=@t  (render-qwen3-chat u.msgs-opt)
+      =/  tokens=(list @ud)  (encode:tokenizer u.tok prompt-text)
+      ?:  =(~ tokens)
+        :_  this
+        (give-http eyre-id 400 ~[['content-type' 'application/json']] (some (as-octs:mimes:html '{"error":"empty prompt after tokenization"}')))
+      =/  n-tokens=@ud  (fall max-tokens-opt 128)
+      =/  to-rs
+        |=  c=@ta  ^-  @rs
+        =/  s=@t  ?:(=('.' (end 3 c)) c (rap 3 ~['.' c]))
+        (slav %rs s)
+      =/  strategy=sampling:mr:maroon
+        :*  temp=?~(temperature .0.7 (to-rs u.temperature))
+            top-k=0
+            top-p=?~(top-p-opt .0.9 (to-rs u.top-p-opt))
+            rep-penalty=.1.2
+        ==
+      =/  stream=?  (fall stream-opt |)
+      =/  model-name=@t  (fall model-opt 'qwen3')
+      =/  response-id=@t  'chatcmpl-session'
+      ~&  >  "OpenAI /v1/chat/completions: {<(lent tokens)>} prompt tokens, max {<n-tokens>}, stream={<stream>}"
+      =/  seed=@  (end [0 31] (mix eny.bowl `@`now.bowl))
+      =/  session-id=@ud  ?:(=(0 seed) 1 `@ud`seed)
+      =/  max-seq=@ud  (add (lent tokens) n-tokens)
+      =/  initial-cards=(list card)
+        ?.  stream
+          :~  [%pass /gen-tick %arvo %b %wait now.bowl]
+          ==
+        =/  sse-headers=(list [@t @t])
+          :~  ['content-type' 'text/event-stream']
+              ['cache-control' 'no-cache']
+              ['x-accel-buffering' 'no']
+              ['access-control-allow-origin' '*']
+          ==
+        =/  resp-header=response-header:http  [200 sse-headers]
+        =/  role-chunk
+          (openai-chunk response-id model-name now.bowl %role '' '')
+        :~  [%give %fact ~[/http-response/[eyre-id]] %http-response-header !>(resp-header)]
+            [%give %fact ~[/http-response/[eyre-id]] %http-response-data !>(`(sse-event-data role-chunk))]
+            [%pass /gen-tick %arvo %b %wait now.bowl]
+        ==
+      =/  new-gen=gen-state
+        :*  eyre-id  tokens  n-tokens  strategy  0
+            now.bowl  now.bowl  (lent tokens)
+            (default-tick-mode state)
+            %new  0  ~  ~  ~  0
+            ''                   ::  text-decoded
+            ~                    ::  rope-cs
+            session-id           ::  kv-session
+            max-seq              ::  kv-max-seq
+            |                    ::  prefilled
+            %openai              ::  api
+            stream               ::  stream
+            response-id
+            model-name
+        ==
+      [initial-cards this(gen `new-gen)]
     --
     ::
       %maroon-load
@@ -699,7 +999,8 @@
   |=  [=wire =sign-arvo]
   ^-  (quip card _this)
   ?+    wire  (on-arvo:def wire sign-arvo)
-      [%eyre %connect ~]  `this
+      [%eyre %connect ~]       `this
+      [%eyre %connect-v1 ~]    `this
       [%gen-tick ~]
     ?~  gen  `this
     =/  g  u.gen
@@ -731,30 +1032,84 @@
       =/  logits-u=(unit tensor:maroon)
         ?:  ?&(?=(^ weights-qwen3) ?=(^ config-qwen3) ?=(^ rope-cs))
           ?.  prefilled.g
-            ::  First forward: prefill allocates KV buffers at max-seq
-            ::  and fills positions 0..prompt_len-1.
-            =/  l=tensor:maroon
-              %:  forward-qwen3-prefill:mr:maroon
-                tokens.g  u.weights-qwen3  u.config-qwen3
-                kv-session.g  kv-max-seq.g
+            =/  x-emb=tensor:maroon
+              (embed-tied-mlx2:maroon tokens.g tok-emb.u.weights-qwen3 u.config-qwen3)
+            =/  x-all=tensor:maroon
+              %:  run-blocks-qwen3:maroon
+                x-emb  blocks.u.weights-qwen3  u.config-qwen3
                 cos.u.rope-cs  sin.u.rope-cs
+                kv-session.g  kv-max-seq.g
               ==
+            ::  Extract the last row from the [S, D] activation as a
+            ::  [1, D] tensor directly from the data atom.  Hoon's
+            ::  get-row iterates set-item D times, which invokes ++sew
+            ::  per element; some vere / pier combos misdispatch sew
+            ::  and crash, so we cut raw bytes and feed the jetted
+            ::  single-row path instead.
+            =/  d-model=@ud  d-model.u.config-qwen3
+            =/  last-idx     (dec (lent tokens.g))
+            =/  row-bytes    (mul d-model 4)
+            =/  last-raw=@
+              (cut 3 [(mul last-idx row-bytes) row-bytes] data.x-all)
+            =/  last-data=@  (mix last-raw (lsh [3 row-bytes] 1))
+            =/  last-row=tensor:maroon
+              :-  `meta:ls`[~[1 d-model] 5 %i754 ~]
+              last-data
+            =/  rn=tensor:maroon
+              %:  rms-norm-row:maroon
+                last-row  ln-f.u.weights-qwen3  rms-eps.u.config-qwen3
+              ==
+            =/  l=tensor:maroon
+              (logits-tied-mlx2:mr:maroon rn tok-emb.u.weights-qwen3 u.config-qwen3)
             `l
-          ::  Decode: writes one new position into the persistent buffers.
-          =/  d=(unit tensor:maroon)
-            %:  forward-qwen3-decode:mr:maroon
-              tokens.g  u.weights-qwen3  u.config-qwen3
+          ::  Decode: one new position into the persistent KV buffers.
+          ::  Inlined to bypass the Hoon get-row in forward-qwen3-final-row
+          ::  (same ++sew crash path as prefill).
+          =/  seq-len     (lent tokens.g)
+          =/  last-tok    (rear tokens.g)
+          =/  position    (dec seq-len)
+          =/  x-single
+            (embed-tied-mlx2:maroon ~[last-tok] tok-emb.u.weights-qwen3 u.config-qwen3)
+          =/  new-x-opt=(unit tensor:maroon)
+            %:  run-decode-qwen3:maroon
+              x-single
+              blocks.u.weights-qwen3
+              u.config-qwen3
+              cos.u.rope-cs  sin.u.rope-cs
+              position
               kv-session.g
-              cos.u.rope-cs  sin.u.rope-cs
             ==
-          ?^  d  d
-          ::  KV miss (LRU evicted, etc.) — rerun prefill.
-          =/  l=tensor:maroon
-            %:  forward-qwen3-prefill:mr:maroon
-              tokens.g  u.weights-qwen3  u.config-qwen3
+          ?^  new-x-opt
+            ::  x-new is [1, D]; rms-norm + logits on it.
+            =/  rn-d=tensor:maroon
+              %:  rms-norm-row:maroon
+                u.new-x-opt  ln-f.u.weights-qwen3  rms-eps.u.config-qwen3
+              ==
+            `(logits-tied-mlx2:mr:maroon rn-d tok-emb.u.weights-qwen3 u.config-qwen3)
+          ::  KV miss — run embed + blocks, then last-row projection.
+          =/  x-emb2=tensor:maroon
+            (embed-tied-mlx2:maroon tokens.g tok-emb.u.weights-qwen3 u.config-qwen3)
+          =/  x-all2=tensor:maroon
+            %:  run-blocks-qwen3:maroon
+              x-emb2  blocks.u.weights-qwen3  u.config-qwen3
+              cos.u.rope-cs  sin.u.rope-cs
               kv-session.g  kv-max-seq.g
-              cos.u.rope-cs  sin.u.rope-cs
             ==
+          =/  d-model2=@ud  d-model.u.config-qwen3
+          =/  last-idx2     (dec (lent tokens.g))
+          =/  row-bytes2    (mul d-model2 4)
+          =/  last-raw2=@
+            (cut 3 [(mul last-idx2 row-bytes2) row-bytes2] data.x-all2)
+          =/  last-data2=@  (mix last-raw2 (lsh [3 row-bytes2] 1))
+          =/  last-row2=tensor:maroon
+            :-  `meta:ls`[~[1 d-model2] 5 %i754 ~]
+            last-data2
+          =/  rn2=tensor:maroon
+            %:  rms-norm-row:maroon
+              last-row2  ln-f.u.weights-qwen3  rms-eps.u.config-qwen3
+            ==
+          =/  l=tensor:maroon
+            (logits-tied-mlx2:mr:maroon rn2 tok-emb.u.weights-qwen3 u.config-qwen3)
           `l
         (forward-loaded state tokens.g)
       ?~  logits-u  `this(gen ~)
@@ -775,17 +1130,35 @@
         0
       =/  text-chunk=@t  (cut 3 [text-sent.g delta-len] full-text)
       =/  total=@dr  (sub now.bowl start.g)
-      ~&  >  ['step' +(step.g) 'tok' next-tok 'text' text-chunk 'total' total]
-      =/  token-card=card
-        =/  chunk-json=json
-          :-  %o
-          %-  ~(gas by *(map @t json))
-          :~  ['type' s+'token']  ['id' (numb:enjs:format next-tok)]
-              ['text' s+text-chunk]
+      ::  Per-tick wire emission, format-aware.  Buffered OpenAI emits
+      ::  nothing until done; streaming OpenAI emits a delta chunk.
+      =/  per-tick-cards=(list card)
+        ?-    api.g
+            %maroon
+          =/  chunk-json=json
+            :-  %o
+            %-  ~(gas by *(map @t json))
+            :~  ['type' s+'token']  ['id' (numb:enjs:format next-tok)]
+                ['text' s+text-chunk]
+            ==
+          :~  :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+                  %http-response-data
+                  !>(`(sse-event-data (en:json:html chunk-json)))
+              ==
           ==
-        :*  %give  %fact  ~[/http-response/[eyre-id.g]]
-            %http-response-data
-            !>(`(sse-event-data (en:json:html chunk-json)))
+        ::
+            %openai
+          ?.  stream.g  ~
+          ?:  =(0 delta-len)  ~
+          =/  chunk-text=@t
+            %:  openai-chunk
+              response-id.g  model-name.g  now.bowl  %content  text-chunk  ''
+            ==
+          :~  :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+                  %http-response-data
+                  !>(`(sse-event-data chunk-text))
+              ==
+          ==
         ==
       =/  remaining   (dec n-remaining.g)
       ::  Stop early on EOS.  Qwen3 emits 151.645 (<|im_end|>) at end of
@@ -797,16 +1170,62 @@
             =(151.643 next-tok)
         ==
       ?:  ?|(=(0 remaining) eos)
-        ~&  >  ['DONE tokens' (lent gen-so-far) 'total' total 'text' full-text]
-        =/  done-card=card
-          =/  done-json=json  [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
-          :*  %give  %fact  ~[/http-response/[eyre-id.g]]
-              %http-response-data
-              !>(`(sse-event-data (en:json:html done-json)))
+        =/  tokens-gen  (lent gen-so-far)
+        =/  ms-unit      (div ~s1 1.000)
+        =/  ms           (div total ms-unit)
+        =/  rate-x10     ?:(=(0 ms) 0 (div (mul tokens-gen 10.000) ms))
+        ~&  >  "done: {<tokens-gen>} tokens in {<total>} ({<(div rate-x10 10)>}.{<(mod rate-x10 10)>} tok/s)"
+        =/  finish-reason=@t  ?:(eos 'stop' 'length')
+        =/  done-cards=(list card)
+          ?-    api.g
+              %maroon
+            =/  done-json=json
+              [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
+            =/  done-card=card
+              :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+                  %http-response-data
+                  !>(`(sse-event-data (en:json:html done-json)))
+              ==
+            =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
+            ~[done-card kick-card]
+          ::
+              %openai
+            ?:  stream.g
+              =/  final-chunk=@t
+                %:  openai-chunk
+                  response-id.g  model-name.g  now.bowl  %final  ''  finish-reason
+                ==
+              =/  final-card=card
+                :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+                    %http-response-data
+                    !>(`(sse-event-data final-chunk))
+                ==
+              ::  OpenAI convention: stream terminator is the literal
+              ::  `data: [DONE]` line.  Emit it as a plain SSE event.
+              =/  done-marker=card
+                :*  %give  %fact  ~[/http-response/[eyre-id.g]]
+                    %http-response-data
+                    !>(`(sse-event-data '[DONE]'))
+                ==
+              =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
+              ~[final-card done-marker kick-card]
+            ::  Buffered: emit one full JSON response via Eyre's
+            ::  simple-payload path (no prior headers have been sent).
+            =/  completion-body=@t
+              %:  openai-completion
+                response-id.g  model-name.g  now.bowl
+                full-text  finish-reason
+                n-prompt.g  (lent gen-so-far)
+              ==
+            %+  give-simple-payload:app:server  eyre-id.g
+            :-  :-  200
+                :~  ['content-type' 'application/json']
+                    ['access-control-allow-origin' '*']
+                ==
+            (some (as-octs:mimes:html completion-body))
           ==
-        =/  kick-card=card  [%give %kick ~[/http-response/[eyre-id.g]] ~]
         :_  this(gen ~, last-output new-tokens)
-        ~[token-card done-card kick-card]
+        (weld per-tick-cards done-cards)
       =/  new-g=gen-state
         %=    g
             tokens         new-tokens
@@ -819,7 +1238,7 @@
             prefilled      &
         ==
       :_  this(gen `new-g)
-      ~[token-card tick-card]
+      (weld per-tick-cards ~[tick-card])
     ::
         ::  +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         ::  Block-stream: embed on the first tick, one transformer block
@@ -907,7 +1326,6 @@
           (sample-token:mr:maroon logits strategy.g tokens.g (mix eny.bowl step.g))
         =/  text-chunk=@t  ?~(tok '' (decode:tokenizer u.tok ~[next-tok]))
         =/  total=@dr  (sub now.bowl start.g)
-        ~&  >  ['step' +(step.g) 'tok' next-tok 'text' text-chunk 'total' total]
         =/  token-card=card
           =/  chunk-json=json
             :-  %o
@@ -924,7 +1342,11 @@
         ?:  =(0 remaining)
           =/  gen-toks  (slag n-prompt.g new-tokens)
           =/  full-text=@t  ?~(tok '' (decode:tokenizer u.tok gen-toks))
-          ~&  >  ['DONE tokens' (lent gen-toks) 'total' total 'text' full-text]
+          =/  tokens-gen  (lent gen-toks)
+          =/  ms-unit     (div ~s1 1.000)
+          =/  ms          (div total ms-unit)
+          =/  rate-x10    ?:(=(0 ms) 0 (div (mul tokens-gen 10.000) ms))
+          ~&  >  "done: {<tokens-gen>} tokens in {<total>} ({<(div rate-x10 10)>}.{<(mod rate-x10 10)>} tok/s)"
           =/  done-card=card
             =/  done-json=json  [%o (~(gas by *(map @t json)) ~[['type' s+'done']])]
             :*  %give  %fact  ~[/http-response/[eyre-id.g]]

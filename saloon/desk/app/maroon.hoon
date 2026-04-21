@@ -705,7 +705,7 @@
       =/  stream=?  (fall stream-opt |)
       =/  model-name=@t  (fall model-opt 'qwen3')
       =/  response-id=@t  'chatcmpl-session'
-      ~&  >  "OpenAI /v1/chat/completions: {<(lent tokens)>} prompt tokens, max {<n-tokens>}, stream={<stream>}"
+      ~&  >  "/v1/chat/completions: {<(lent tokens)>} prompt tokens, max {<n-tokens>}, stream={<stream>}"
       =/  seed=@  (end [0 31] (mix eny.bowl `@`now.bowl))
       =/  session-id=@ud  ?:(=(0 seed) 1 `@ud`seed)
       =/  max-seq=@ud  (add (lent tokens) n-tokens)
